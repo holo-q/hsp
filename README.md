@@ -11,6 +11,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `crates/hsp-wire` owns serializable DTOs and wire invariants. It must stay light: no async runtime, storage, LSP, TUI, or parser stacks.
 - `crates/hsp-store` owns persistence and row mapping only. JSONL append/replay lives here, not in bus policy.
 - `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
+- `crates/hsp-session` owns broker session identity and registry state. It does not start language servers.
 - `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, and later tickets/questions/presence.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` is currently a probe binary for checking which workgroup stack HSP sees from a path.

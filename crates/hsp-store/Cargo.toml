@@ -1,0 +1,11 @@
+[package]
+name = "hsp-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Persistence primitives for HSP"
+
+[dependencies]
+hsp-wire.workspace = true
+serde_json.workspace = true

@@ -9,6 +9,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 ## Architecture
 
 - `crates/hsp-wire` owns serializable DTOs and wire invariants. It must stay light: no async runtime, storage, LSP, TUI, or parser stacks.
+- `crates/hsp-store` owns persistence and row mapping only. JSONL append/replay lives here, not in bus policy.
 - `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
 - `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, and later tickets/questions/presence.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
@@ -18,7 +19,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 ## Parity Path
 
 1. Keep `hsp-wire` data-first and preserve JSON shape before adding runtime behavior.
-2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, gates, and storage.
+2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, and gates while keeping storage behind `hsp-store`.
 3. Add broker JSONL socket framing only after the bus and wire model are stable.
 4. Port LSP routing/session management as a runtime crate, not as DTO residue.
 5. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.

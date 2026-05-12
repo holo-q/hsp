@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/hsp-bus",
     "crates/hsp-org",
+    "crates/hsp-store",
     "crates/hsp-wire",
 ]
 resolver = "3"
@@ -16,6 +17,7 @@ license = "MIT"
 [workspace.dependencies]
 hsp-bus = { path = "crates/hsp-bus" }
 hsp-org = { path = "crates/hsp-org" }
+hsp-store = { path = "crates/hsp-store" }
 hsp-wire = { path = "crates/hsp-wire" }
 orgmap = { path = "../orgmap" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +34,7 @@ license.workspace = true
 [dependencies]
 hsp-bus.workspace = true
 hsp-org.workspace = true
+hsp-store.workspace = true
 hsp-wire.workspace = true
 
 [profile.release]

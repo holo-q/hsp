@@ -122,6 +122,7 @@ version = "0.1.0"
 dependencies = [
  "hsp-bus",
  "hsp-org",
+ "hsp-store",
  "hsp-wire",
 ]
 
@@ -137,6 +138,14 @@ name = "hsp-org"
 version = "0.1.0"
 dependencies = [
  "orgmap",
+]
+
+[[package]]
+name = "hsp-store"
+version = "0.1.0"
+dependencies = [
+ "hsp-wire",
+ "serde_json",
 ]
 
 [[package]]

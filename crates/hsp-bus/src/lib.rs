@@ -240,6 +240,36 @@ impl BusJournal {
             .collect()
     }
 
+    pub fn recent_all(&self, after_seq: u64, limit: usize) -> Vec<&BusEvent> {
+        tail(
+            self.events
+                .iter()
+                .filter(|event| event.seq > after_seq)
+                .collect(),
+            limit,
+        )
+    }
+
+    pub fn recent_under_roots(
+        &self,
+        roots: &[String],
+        after_seq: u64,
+        limit: usize,
+    ) -> Vec<&BusEvent> {
+        tail(
+            self.events
+                .iter()
+                .filter(|event| {
+                    event.seq > after_seq
+                        && roots
+                            .iter()
+                            .any(|root| same_or_descendant(&event.workspace_root, root))
+                })
+                .collect(),
+            limit,
+        )
+    }
+
     pub fn recent_is_truncated(&self, query: &EventQuery, selected_count: usize) -> bool {
         self.events
             .iter()
@@ -507,6 +537,27 @@ fn digest_message(question: &BusQuestion, reply_count: usize, related_count: usi
     message
 }
 
+fn tail(events: Vec<&BusEvent>, limit: usize) -> Vec<&BusEvent> {
+    events
+        .into_iter()
+        .rev()
+        .take(limit.max(1))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn same_or_descendant(child: &str, parent: &str) -> bool {
+    let child = normalize_root(child);
+    let parent = normalize_root(parent);
+    child == parent || child.starts_with(&format!("{parent}/"))
+}
+
+fn normalize_root(root: &str) -> String {
+    root.trim().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,6 +723,38 @@ mod tests {
         assert_eq!(
             journal.visible_presence_for_workspace("/repo", 1000.0)[0].status,
             PresenceStatus::Active
+        );
+    }
+
+    #[test]
+    fn recent_all_and_tree_watch_order() {
+        let mut journal = BusJournal::new();
+        for (root, message) in [
+            ("/workspace", "umbrella"),
+            ("/workspace/domain", "domain"),
+            ("/workspace-other", "other"),
+        ] {
+            let mut append = JournalAppend::new(BusEventKind::NotePosted);
+            append.workspace_root = root.to_string();
+            append.message = message.to_string();
+            journal.append(append);
+        }
+
+        assert_eq!(
+            journal
+                .recent_all(1, 10)
+                .into_iter()
+                .map(|event| event.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["domain", "other"]
+        );
+        assert_eq!(
+            journal
+                .recent_under_roots(&["/workspace".to_string()], 0, 10)
+                .into_iter()
+                .map(|event| event.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["umbrella", "domain"]
         );
     }
 }

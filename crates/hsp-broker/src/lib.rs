@@ -67,6 +67,8 @@ impl BrokerCore {
             "bus.reply" => self.bus_reply(&request, false),
             "bus.question" => self.bus_question(&request),
             "bus.recent" => self.bus_recent(&request),
+            "bus.recent_all" => self.bus_recent_all(&request),
+            "bus.recent_tree" => self.bus_recent_tree(&request),
             "bus.journal" => self.bus_journal(&request),
             "bus.settle" => self.bus_settle(&request),
             "bus.weather" => self.bus_weather(&request),
@@ -368,6 +370,40 @@ impl BrokerCore {
         }))
     }
 
+    fn bus_recent_all(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let after_seq = optional_u64(&request.params, "after_id")?.unwrap_or(0);
+        let limit = bounded_limit(&request.params, DEFAULT_RECENT_LIMIT, 200)?;
+        let events = self
+            .bus
+            .recent_all(after_seq, limit)
+            .into_iter()
+            .map(BusEventWire::from)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "events": events,
+            "truncated": false,
+            "last_event_id": self.bus.last_event_id(),
+        }))
+    }
+
+    fn bus_recent_tree(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let roots = workspace_roots(&request.params);
+        let after_seq = optional_u64(&request.params, "after_id")?.unwrap_or(0);
+        let limit = bounded_limit(&request.params, DEFAULT_RECENT_LIMIT, 200)?;
+        let events = self
+            .bus
+            .recent_under_roots(&roots, after_seq, limit)
+            .into_iter()
+            .map(BusEventWire::from)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "events": events,
+            "truncated": false,
+            "last_event_id": self.bus.last_event_id(),
+            "workspace_roots": roots,
+        }))
+    }
+
     fn bus_journal(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
         let now = now_from_params(&request.params)?;
@@ -596,6 +632,25 @@ fn workspace_root(params: &serde_json::Map<String, Value>) -> String {
         } else {
             std::env::current_dir().unwrap_or_default().join(path)
         }
+    };
+    path.to_string_lossy().into_owned()
+}
+
+fn workspace_roots(params: &serde_json::Map<String, Value>) -> Vec<String> {
+    let roots = strings(params.get("workspace_roots"));
+    if roots.is_empty() {
+        vec![workspace_root(params)]
+    } else {
+        roots.into_iter().map(normalize_root).collect()
+    }
+}
+
+fn normalize_root(raw: String) -> String {
+    let path = std::path::PathBuf::from(raw);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
     };
     path.to_string_lossy().into_owned()
 }
@@ -1405,6 +1460,61 @@ mod tests {
         assert_eq!(weather["result"]["status"]["agent_count"], json!(1));
         assert_eq!(bus_status["result"]["agent_count"], json!(1));
         assert!(status["result"]["bus"].get("agent_count").is_some());
+    }
+
+    #[test]
+    fn bus_recent_all_and_recent_tree_cover_watch_surfaces() {
+        let mut core = BrokerCore::new_at(10.0);
+        for (root, message) in [
+            ("/workspace", "umbrella"),
+            ("/workspace/domain", "domain"),
+            ("/workspace-other", "other"),
+        ] {
+            handle(
+                &mut core,
+                json!({
+                    "id": message,
+                    "method": "bus.note",
+                    "params": {"workspace_root": root, "message": message},
+                }),
+            );
+        }
+
+        let all = handle(
+            &mut core,
+            json!({
+                "id": "all",
+                "method": "bus.recent_all",
+                "params": {"after_id": 1},
+            }),
+        );
+        let tree = handle(
+            &mut core,
+            json!({
+                "id": "tree",
+                "method": "bus.recent_tree",
+                "params": {"workspace_root": "/workspace"},
+            }),
+        );
+
+        assert_eq!(
+            all["result"]["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|event| event["message"].as_str().expect("message"))
+                .collect::<Vec<_>>(),
+            vec!["domain", "other"]
+        );
+        assert_eq!(
+            tree["result"]["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|event| event["message"].as_str().expect("message"))
+                .collect::<Vec<_>>(),
+            vec!["umbrella", "domain"]
+        );
     }
 
     #[test]

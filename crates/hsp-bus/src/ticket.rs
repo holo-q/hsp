@@ -48,6 +48,26 @@ impl TicketIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketEffectKind {
+    Started,
+    Joined,
+    Released,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketEffect {
+    pub kind: TicketEffectKind,
+    pub ticket: Ticket,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketHold {
+    pub ticket: Option<Ticket>,
+    pub effects: Vec<TicketEffect>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BuildGate {
     pub workspace_root: String,
@@ -95,9 +115,19 @@ impl TicketBoard {
     }
 
     pub fn hold(&mut self, intent: TicketIntent) -> Option<Ticket> {
+        self.hold_with_effects(intent).ticket
+    }
+
+    pub fn hold_with_effects(&mut self, intent: TicketIntent) -> TicketHold {
         if intent.message.trim().is_empty() {
-            self.release(&intent.workspace_root, &intent.agent_id, intent.now);
-            return None;
+            return TicketHold {
+                ticket: None,
+                effects: self.release_with_effects(
+                    &intent.workspace_root,
+                    &intent.agent_id,
+                    intent.now,
+                ),
+            };
         }
 
         if let Some(ticket_id) = self.agent_tickets.get(&intent.agent_id).cloned() {
@@ -109,18 +139,27 @@ impl TicketBoard {
                     merge_scope(&mut ticket.scope, &intent.scope);
                     merge_items(&mut ticket.projects, &intent.projects);
                     ticket.holders.insert(intent.agent_id, intent.now);
-                    return Some(ticket.clone());
+                    return TicketHold {
+                        ticket: Some(ticket.clone()),
+                        effects: Vec::new(),
+                    };
                 }
             }
         }
 
-        self.release(&intent.workspace_root, &intent.agent_id, intent.now);
+        let mut effects =
+            self.release_with_effects(&intent.workspace_root, &intent.agent_id, intent.now);
         self.discard_build_waiter(&intent.workspace_root, &intent.agent_id);
 
-        let ticket_id = self
+        let existing_ticket_id = self
             .find_open_ticket(&intent.workspace_root, &intent.message)
-            .map(|ticket| ticket.ticket_id.clone())
-            .unwrap_or_else(|| self.create_ticket(&intent));
+            .map(|ticket| ticket.ticket_id.clone());
+        let effect_kind = if existing_ticket_id.is_some() {
+            TicketEffectKind::Joined
+        } else {
+            TicketEffectKind::Started
+        };
+        let ticket_id = existing_ticket_id.unwrap_or_else(|| self.create_ticket(&intent));
 
         let ticket = self
             .tickets
@@ -130,10 +169,37 @@ impl TicketBoard {
         merge_items(&mut ticket.projects, &intent.projects);
         ticket.holders.insert(intent.agent_id.clone(), intent.now);
         self.agent_tickets.insert(intent.agent_id, ticket_id);
-        Some(ticket.clone())
+        let ticket = ticket.clone();
+        effects.push(TicketEffect {
+            kind: effect_kind,
+            ticket: ticket.clone(),
+        });
+        TicketHold {
+            ticket: Some(ticket),
+            effects,
+        }
     }
 
     pub fn release(&mut self, workspace_root: &str, agent_id: &str, now: f64) -> Vec<Ticket> {
+        let effects = self.release_with_effects(workspace_root, agent_id, now);
+        if matches!(
+            effects.last().map(|effect| effect.kind),
+            Some(TicketEffectKind::Closed)
+        ) {
+            return effects
+                .last()
+                .map(|effect| vec![effect.ticket.clone()])
+                .unwrap_or_default();
+        }
+        effects.into_iter().map(|effect| effect.ticket).collect()
+    }
+
+    pub fn release_with_effects(
+        &mut self,
+        workspace_root: &str,
+        agent_id: &str,
+        now: f64,
+    ) -> Vec<TicketEffect> {
         let Some(ticket_id) = self.agent_tickets.remove(agent_id) else {
             return Vec::new();
         };
@@ -145,10 +211,19 @@ impl TicketBoard {
         }
 
         ticket.holders.remove(agent_id);
+        let released = ticket.clone();
+        let mut effects = vec![TicketEffect {
+            kind: TicketEffectKind::Released,
+            ticket: released,
+        }];
         if ticket.holders.is_empty() {
             ticket.closed_at = Some(now);
+            effects.push(TicketEffect {
+                kind: TicketEffectKind::Closed,
+                ticket: ticket.clone(),
+            });
         }
-        vec![ticket.clone()]
+        effects
     }
 
     pub fn active_tickets(&self, workspace_root: &str) -> Vec<Ticket> {
@@ -157,6 +232,10 @@ impl TicketBoard {
             .filter(|ticket| ticket.workspace_root == workspace_root && ticket.is_open())
             .cloned()
             .collect()
+    }
+
+    pub fn open_ticket_count(&self) -> usize {
+        self.tickets.values().filter(|ticket| ticket.is_open()).count()
     }
 
     pub fn build_gate(
@@ -271,7 +350,11 @@ impl TicketBoard {
     fn find_open_ticket(&self, workspace_root: &str, message: &str) -> Option<&Ticket> {
         self.tickets
             .values()
-            .find(|ticket| ticket.workspace_root == workspace_root && ticket.message == message && ticket.is_open())
+            .find(|ticket| {
+                ticket.workspace_root == workspace_root
+                    && ticket.message == message
+                    && ticket.is_open()
+            })
     }
 
     fn create_ticket(&mut self, intent: &TicketIntent) -> String {
@@ -328,7 +411,9 @@ fn build_gate_key(workspace_root: &str, projects: &[String]) -> String {
 }
 
 fn ticket_blocks_project(ticket: &Ticket, projects: &[String]) -> bool {
-    projects.is_empty() || ticket.projects.is_empty() || scope_items_overlap(&ticket.projects, projects)
+    projects.is_empty()
+        || ticket.projects.is_empty()
+        || scope_items_overlap(&ticket.projects, projects)
 }
 
 fn ticket_blocks_scope(ticket: &Ticket, scope: &BusScope, full_workspace: bool) -> bool {
@@ -429,8 +514,20 @@ mod tests {
         board.hold(intent("agent-b", "edit server"));
 
         let cold = board.build_gate("/repo", None, BusScope::empty(), Vec::new(), false);
-        let one_waiting = board.build_gate("/repo", Some("agent-a"), BusScope::empty(), Vec::new(), false);
-        let all_waiting = board.build_gate("/repo", Some("agent-b"), BusScope::empty(), Vec::new(), false);
+        let one_waiting = board.build_gate(
+            "/repo",
+            Some("agent-a"),
+            BusScope::empty(),
+            Vec::new(),
+            false,
+        );
+        let all_waiting = board.build_gate(
+            "/repo",
+            Some("agent-b"),
+            BusScope::empty(),
+            Vec::new(),
+            false,
+        );
 
         assert!(!cold.unlocked);
         assert_eq!(cold.reason, "active_tickets");

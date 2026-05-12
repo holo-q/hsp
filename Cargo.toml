@@ -1,13 +1,38 @@
-[package]
-name = "hsp"
+[workspace]
+members = [
+    ".",
+    "crates/hsp-bus",
+    "crates/hsp-org",
+    "crates/hsp-wire",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 authors = ["nuck"]
-description = "Rust rewrite of the Harness Server Protocol"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+hsp-bus = { path = "crates/hsp-bus" }
+hsp-org = { path = "crates/hsp-org" }
+hsp-wire = { path = "crates/hsp-wire" }
 orgmap = { path = "../orgmap" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package]
+name = "hsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Rust rewrite of the Harness Server Protocol"
+license.workspace = true
+
+[dependencies]
+hsp-bus.workspace = true
+hsp-org.workspace = true
+hsp-wire.workspace = true
 
 [profile.release]
 lto = "thin"

@@ -1,19 +1,24 @@
 # HSP
 
-Rust rewrite shell for the Harness Server Protocol.
+Rust rewrite of the Harness Server Protocol.
 
 The Python implementation has been moved to [references/hsp-py](references/hsp-py) and remains the feature reference during the rewrite. It is kept as a reference repository at commit `a7af7b4` so the Rust crate can move without flattening the old history. Its [feature preservation ledger](references/hsp-py/README.md#feature-preservation-ledger) is the migration checklist.
 
 Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgroup` library. HSP should consume that map boundary instead of reimplementing marker parsing, hierarchy discovery, observation roots, color/icon identity, or workspace naming.
 
-## Current Shape
+## Architecture
 
-- `src/lib.rs` exposes the first Rust-side workspace discovery shell.
-- `src/main.rs` is a tiny probe binary for checking which workgroup stack HSP sees from a path.
+- `crates/hsp-wire` owns serializable DTOs and wire invariants. It must stay light: no async runtime, storage, LSP, TUI, or parser stacks.
+- `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
+- `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, and later tickets/questions/presence.
+- `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
+- `src/main.rs` is currently a probe binary for checking which workgroup stack HSP sees from a path.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.
 
-## Next Movement
+## Parity Path
 
-1. Port the broker wire model and event bus types as data-first Rust modules.
-2. Fold workgroup discovery through `orgmap` before touching bus scope logic.
-3. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.
+1. Keep `hsp-wire` data-first and preserve JSON shape before adding runtime behavior.
+2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, gates, and storage.
+3. Add broker JSONL socket framing only after the bus and wire model are stable.
+4. Port LSP routing/session management as a runtime crate, not as DTO residue.
+5. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.

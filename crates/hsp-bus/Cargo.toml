@@ -1,0 +1,10 @@
+[package]
+name = "hsp-bus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Agent bus policy for HSP"
+
+[dependencies]
+hsp-wire.workspace = true

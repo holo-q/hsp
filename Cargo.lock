@@ -120,7 +120,31 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hsp"
 version = "0.1.0"
 dependencies = [
+ "hsp-bus",
+ "hsp-org",
+ "hsp-wire",
+]
+
+[[package]]
+name = "hsp-bus"
+version = "0.1.0"
+dependencies = [
+ "hsp-wire",
+]
+
+[[package]]
+name = "hsp-org"
+version = "0.1.0"
+dependencies = [
  "orgmap",
+]
+
+[[package]]
+name = "hsp-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

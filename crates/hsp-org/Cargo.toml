@@ -1,0 +1,10 @@
+[package]
+name = "hsp-org"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HSP workgroup facade over orgmap"
+
+[dependencies]
+orgmap.workspace = true

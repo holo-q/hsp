@@ -1,0 +1,13 @@
+[package]
+name = "hsp-wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Wire DTOs for the Harness Server Protocol"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

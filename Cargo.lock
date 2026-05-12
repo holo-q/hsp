@@ -174,11 +174,22 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hsp"
 version = "0.1.0"
 dependencies = [
+ "hsp-broker",
  "hsp-bus",
  "hsp-org",
  "hsp-session",
  "hsp-store",
  "hsp-wire",
+]
+
+[[package]]
+name = "hsp-broker"
+version = "0.1.0"
+dependencies = [
+ "hsp-bus",
+ "hsp-session",
+ "hsp-wire",
+ "serde_json",
 ]
 
 [[package]]

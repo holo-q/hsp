@@ -13,6 +13,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
 - `crates/hsp-session` owns broker session identity and registry state. It does not start language servers.
 - `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, and later tickets/questions/presence.
+- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice is in-process only; socket serving and LSP supervision come later.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` is currently a probe binary for checking which workgroup stack HSP sees from a path.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.

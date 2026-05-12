@@ -1,6 +1,10 @@
+mod ticket;
+
 use std::collections::BTreeMap;
 
 use hsp_wire::{BusEvent, BusEventKind, BusScope, MAX_MESSAGE_BYTES, truncate_message};
+
+pub use ticket::{BuildGate, EditGate, EditGateMode, Ticket, TicketBoard, TicketIntent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JournalAppend {

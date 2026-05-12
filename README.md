@@ -12,8 +12,8 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `crates/hsp-store` owns persistence and row mapping only. JSONL append/replay lives here, not in bus policy.
 - `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
 - `crates/hsp-session` owns broker session identity and registry state. It does not start language servers.
-- `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, event wire views, ticket lifecycle transitions, questions/replies/settle digests, build gates, and edit gates. Presence is the next bus-owned parity layer.
-- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice is in-process only and exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, and ticket/build/edit gates; socket serving, persistence wiring, and LSP supervision come later.
+- `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, event wire views, ticket lifecycle transitions, questions/replies/settle digests, decaying presence, build gates, and edit gates.
+- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice is in-process only and exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates; socket serving, persistence wiring, and LSP supervision come later.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` is currently a probe binary for checking which workgroup stack HSP sees from a path.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.
@@ -21,7 +21,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 ## Parity Path
 
 1. Keep `hsp-wire` data-first and preserve JSON shape before adding runtime behavior.
-2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, and gates while keeping storage behind `hsp-store`. Ticket transitions and question closes now emit durable-shaped event rows through the same journal path as ordinary bus events.
+2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, and gates while keeping storage behind `hsp-store`. Ticket transitions and question closes now emit durable-shaped event rows through the same journal path as ordinary bus events, and every durable event updates the derived presence view.
 3. Wire `hsp-store` into broker/runtime after the in-memory bus contract is pinned; append/recent/journal shapes should not change when JSONL replay lands.
 4. Port LSP routing/session management as a runtime crate, not as DTO residue.
 5. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.

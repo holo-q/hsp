@@ -1,3 +1,4 @@
+mod presence;
 mod question;
 mod ticket;
 
@@ -6,6 +7,10 @@ use std::collections::BTreeMap;
 use hsp_wire::{BusEvent, BusEventKind, BusScope, MAX_MESSAGE_BYTES, truncate_message};
 use serde::Serialize;
 
+pub use presence::{
+    ACTIVE_WINDOW_SECONDS, PIN_PROMPT_THRESHOLD, PRUNE_WINDOW_SECONDS, PresenceEntry,
+    PresenceEntryWire, PresenceStatus, PresenceTracker,
+};
 pub use question::{BusQuestion, BusQuestionWire, QuestionOpen};
 pub use ticket::{
     BuildGate, EditGate, EditGateMode, Ticket, TicketBoard, TicketEffect, TicketEffectKind,
@@ -99,6 +104,7 @@ impl JournalAppend {
 pub struct BusJournal {
     events: Vec<BusEvent>,
     questions: BTreeMap<String, BusQuestion>,
+    presence: PresenceTracker,
     next_question_id: u64,
 }
 
@@ -107,6 +113,7 @@ impl Default for BusJournal {
         Self {
             events: Vec::new(),
             questions: BTreeMap::new(),
+            presence: PresenceTracker::new(),
             next_question_id: 1,
         }
     }
@@ -150,7 +157,34 @@ impl BusJournal {
             schema_version: hsp_wire::SCHEMA_VERSION,
         });
 
-        self.events.last().expect("event was just pushed")
+        let event = self.events.last().expect("event was just pushed");
+        self.presence.observe(event);
+        event
+    }
+
+    pub fn heartbeat(&mut self, append: JournalAppend) -> Option<PresenceEntry> {
+        let clipped = truncate_message(&append.message, MAX_MESSAGE_BYTES);
+        let event = BusEvent {
+            seq: 0,
+            event_id: "heartbeat".to_string(),
+            kind: BusEventKind::AgentHeartbeat,
+            timestamp: append.timestamp,
+            workspace_id: append.workspace_id,
+            workspace_root: append.workspace_root,
+            agent_id: append.agent_id,
+            client_id: append.client_id,
+            session_id: append.session_id,
+            task_id: append.task_id,
+            git_head: append.git_head,
+            dirty_hash: append.dirty_hash,
+            scope: append.scope,
+            message: clipped.message,
+            metadata: append.metadata,
+            question_id: append.question_id,
+            truncated: clipped.truncated,
+            schema_version: hsp_wire::SCHEMA_VERSION,
+        };
+        self.presence.observe(&event)
     }
 
     pub fn events(&self) -> &[BusEvent] {
@@ -395,6 +429,37 @@ impl BusJournal {
             .collect()
     }
 
+    pub fn observe_presence(&mut self, event: &BusEvent) -> Option<PresenceEntry> {
+        self.presence.observe(event)
+    }
+
+    pub fn visible_presence(&self, now: f64) -> Vec<PresenceEntry> {
+        self.presence.visible(now)
+    }
+
+    pub fn presence_snapshot_for_workspace(
+        &self,
+        workspace_root: &str,
+        now: f64,
+    ) -> Vec<PresenceEntry> {
+        self.presence
+            .snapshot(now)
+            .into_iter()
+            .filter(|entry| entry.workspace_root == workspace_root)
+            .collect()
+    }
+
+    pub fn visible_presence_for_workspace(
+        &self,
+        workspace_root: &str,
+        now: f64,
+    ) -> Vec<PresenceEntry> {
+        self.visible_presence(now)
+            .into_iter()
+            .filter(|entry| entry.workspace_root == workspace_root)
+            .collect()
+    }
+
     fn related_events(&self, question: &BusQuestion, now: f64) -> Vec<BusEvent> {
         self.events
             .iter()
@@ -539,5 +604,74 @@ mod tests {
 
         assert_eq!(event.metadata.get("late"), Some(&"true".to_string()));
         assert_eq!(updated.closed_at, Some(100.0));
+    }
+
+    #[test]
+    fn presence_tracks_active_asleep_pruned_and_session_stop() {
+        let mut journal = BusJournal::new();
+        let mut append = JournalAppend::new(BusEventKind::AgentStarted);
+        append.timestamp = 1000.0;
+        append.workspace_root = "/repo".to_string();
+        append.agent_id = "agent-a".to_string();
+        journal.append(append);
+
+        assert_eq!(
+            journal.visible_presence_for_workspace("/repo", 1059.0)[0].status,
+            PresenceStatus::Active
+        );
+        assert_eq!(
+            journal.visible_presence_for_workspace("/repo", 1060.0)[0].status,
+            PresenceStatus::Asleep
+        );
+        assert!(journal
+            .visible_presence_for_workspace("/repo", 1601.0)
+            .is_empty());
+
+        let mut stop = JournalAppend::new(BusEventKind::SessionStop);
+        stop.timestamp = 2000.0;
+        stop.workspace_root = "/repo".to_string();
+        stop.agent_id = "agent-b".to_string();
+        journal.append(stop);
+
+        assert_eq!(
+            journal.visible_presence_for_workspace("/repo", 2000.0)[0].status,
+            PresenceStatus::Asleep
+        );
+    }
+
+    #[test]
+    fn prompt_count_pins_presence_past_prune_window() {
+        let mut journal = BusJournal::new();
+        let mut prompt = JournalAppend::new(BusEventKind::UserPrompt);
+        prompt.timestamp = 1000.0;
+        prompt.workspace_root = "/repo".to_string();
+        prompt.agent_id = "main-thread".to_string();
+        prompt
+            .metadata
+            .insert("prompt_count".to_string(), "2".to_string());
+        journal.append(prompt);
+
+        let agents = journal.visible_presence_for_workspace("/repo", 2000.0);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, PresenceStatus::Asleep);
+        assert!(agents[0].pinned);
+    }
+
+    #[test]
+    fn heartbeat_updates_presence_without_appending_event() {
+        let mut journal = BusJournal::new();
+        let mut heartbeat = JournalAppend::new(BusEventKind::AgentHeartbeat);
+        heartbeat.timestamp = 1000.0;
+        heartbeat.workspace_root = "/repo".to_string();
+        heartbeat.agent_id = "agent-heart".to_string();
+
+        let entry = journal.heartbeat(heartbeat).expect("presence entry");
+
+        assert_eq!(entry.agent_id, "agent-heart");
+        assert!(journal.events().is_empty());
+        assert_eq!(
+            journal.visible_presence_for_workspace("/repo", 1000.0)[0].status,
+            PresenceStatus::Active
+        );
     }
 }

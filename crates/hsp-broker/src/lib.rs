@@ -57,10 +57,12 @@ impl BrokerCore {
             "session.get_or_create" => self.session_get_or_create(&request),
             "session.list" => Ok(json!(self.session_records())),
             "session.stop" => self.session_stop(&request),
-            "bus.status" => Ok(self.bus_status_value(now_seconds())),
+            "bus.status" => self.bus_status(&request),
             "bus.append" | "bus.event" => self.bus_event(&request, None),
             "bus.note" => self.bus_event(&request, Some(BusEventKind::NotePosted)),
             "bus.chat" => self.bus_chat(&request),
+            "bus.heartbeat" => self.bus_heartbeat(&request),
+            "bus.presence" => self.bus_presence(&request),
             "bus.ask" => self.bus_ask(&request),
             "bus.reply" => self.bus_reply(&request, false),
             "bus.question" => self.bus_question(&request),
@@ -125,14 +127,19 @@ impl BrokerCore {
             .into_iter()
             .map(|question| question.to_wire(now))
             .collect::<Vec<_>>();
+        let agent_count = self.bus.visible_presence(now).len();
         json!({
             "event_count": self.bus.event_count(),
             "last_event_id": self.bus.last_event_id(),
             "open_question_count": self.bus.open_question_count(),
             "open_questions": open_questions,
             "open_ticket_count": self.tickets.open_ticket_count(),
-            "agent_count": 0,
+            "agent_count": agent_count,
         })
+    }
+
+    fn bus_status(&self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        Ok(self.bus_status_value(now_from_params(&request.params)?))
     }
 
     fn session_get_or_create(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
@@ -213,6 +220,38 @@ impl BrokerCore {
         self.bus_reply(request, true)
     }
 
+    fn bus_heartbeat(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let now = now_from_params(&request.params)?;
+        let mut append = journal_append_from_params(&request.params, BusEventKind::AgentHeartbeat)?;
+        append.timestamp = now;
+        let agent = self
+            .bus
+            .heartbeat(append)
+            .map(|entry| json!(entry.to_wire(now)))
+            .unwrap_or_else(|| json!({}));
+        Ok(json!({"agent": agent}))
+    }
+
+    fn bus_presence(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let root = workspace_root(&request.params);
+        let now = now_from_params(&request.params)?;
+        let include_pruned = optional_bool(&request.params, "include_pruned")?.unwrap_or(false);
+        let entries = if include_pruned {
+            self.bus
+                .presence_snapshot_for_workspace(&root, now)
+        } else {
+            self.bus.visible_presence_for_workspace(&root, now)
+        };
+        let agents = entries
+            .iter()
+            .map(|entry| entry.to_wire(now))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "workspace_root": root,
+            "agents": agents,
+        }))
+    }
+
     fn bus_ask(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
         let busy_agents = busy_agent_ids(&self.tickets.active_tickets(&root));
@@ -273,7 +312,7 @@ impl BrokerCore {
                 "question requires id or question_id",
             ));
         }
-        let now = optional_f64(&request.params, "now")?.unwrap_or_else(now_seconds);
+        let now = now_from_params(&request.params)?;
         let question = self.bus.question(&question_id).ok_or_else(|| {
             BrokerWireError::new(
                 BrokerErrorCode::InvalidParams,
@@ -294,7 +333,7 @@ impl BrokerCore {
 
     fn bus_recent(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let query = event_query_from_params(&request.params, DEFAULT_RECENT_LIMIT)?;
-        let now = optional_f64(&request.params, "now")?.unwrap_or_else(now_seconds);
+        let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
         self.bus.settle(&query.workspace_root, now, &append);
         let events = self.bus.recent(&query);
@@ -331,7 +370,7 @@ impl BrokerCore {
 
     fn bus_journal(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
-        let now = optional_f64(&request.params, "now")?.unwrap_or_else(now_seconds);
+        let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
         self.bus.settle(&root, now, &append);
         let limit = bounded_limit(&request.params, DEFAULT_JOURNAL_LIMIT, 100)?;
@@ -357,7 +396,7 @@ impl BrokerCore {
 
     fn bus_settle(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
-        let now = optional_f64(&request.params, "now")?.unwrap_or_else(now_seconds);
+        let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
         let closed = self
             .bus
@@ -370,7 +409,7 @@ impl BrokerCore {
 
     fn bus_weather(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
-        let now = optional_f64(&request.params, "now")?.unwrap_or_else(now_seconds);
+        let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
         self.bus.settle(&root, now, &append);
         let events = self
@@ -385,11 +424,18 @@ impl BrokerCore {
             .into_iter()
             .map(|question| question.to_wire(now))
             .collect::<Vec<_>>();
+        let entries = self
+            .bus
+            .visible_presence_for_workspace(&root, now);
+        let agents = entries
+            .iter()
+            .map(|entry| entry.to_wire(now))
+            .collect::<Vec<_>>();
         Ok(json!({
             "workspace_root": root,
             "open_questions": open_questions.clone(),
             "recent": events,
-            "agents": [],
+            "agents": agents,
             "status": self.bus_status_value(now),
         }))
     }
@@ -501,6 +547,11 @@ fn optional_f64(
             format!("{name} must be a number"),
         )),
     }
+}
+
+fn now_from_params(params: &serde_json::Map<String, Value>) -> Result<f64, BrokerWireError> {
+    let now = optional_f64(params, "now")?.unwrap_or_else(now_seconds);
+    Ok(now + optional_f64(params, "now_offset")?.unwrap_or(0.0))
 }
 
 fn optional_u64(
@@ -680,7 +731,7 @@ fn journal_append_from_params(
 ) -> Result<JournalAppend, BrokerWireError> {
     let workspace_root = workspace_root(params);
     let mut append = JournalAppend::new(kind);
-    append.timestamp = optional_f64(params, "now")?.unwrap_or_else(now_seconds);
+    append.timestamp = now_from_params(params)?;
     append.workspace_id = workspace_id(&workspace_root);
     append.workspace_root = workspace_root;
     append.agent_id = params
@@ -1210,6 +1261,150 @@ mod tests {
             }),
         );
         assert_eq!(weather["result"]["open_questions"], json!([]));
+    }
+
+    #[test]
+    fn bus_heartbeat_registers_presence_without_recent_event_noise() {
+        let mut core = BrokerCore::new_at(10.0);
+        let heartbeat = handle(
+            &mut core,
+            json!({
+                "id": "heartbeat",
+                "method": "bus.heartbeat",
+                "params": {
+                    "workspace_root": "/repo",
+                    "agent_id": "agent-tool",
+                    "client_id": "client-1",
+                    "now": 100.0,
+                },
+            }),
+        );
+
+        assert_eq!(heartbeat["result"]["agent"]["agent_id"], json!("agent-tool"));
+        let presence = handle(
+            &mut core,
+            json!({
+                "id": "presence",
+                "method": "bus.presence",
+                "params": {"workspace_root": "/repo", "now": 100.0},
+            }),
+        );
+        let recent = handle(
+            &mut core,
+            json!({
+                "id": "recent",
+                "method": "bus.recent",
+                "params": {"workspace_root": "/repo", "now": 100.0},
+            }),
+        );
+
+        assert_eq!(presence["result"]["agents"][0]["state"], json!("active"));
+        assert_eq!(recent["result"]["events"], json!([]));
+    }
+
+    #[test]
+    fn bus_presence_decays_and_pins_prompt_threads() {
+        let mut core = BrokerCore::new_at(10.0);
+        handle(
+            &mut core,
+            json!({
+                "id": "started",
+                "method": "bus.append",
+                "params": {
+                    "workspace_root": "/repo",
+                    "event_type": "agent.started",
+                    "agent_id": "agent-stale",
+                    "now": 100.0,
+                },
+            }),
+        );
+        let asleep = handle(
+            &mut core,
+            json!({
+                "id": "presence",
+                "method": "bus.presence",
+                "params": {"workspace_root": "/repo", "now": 220.0},
+            }),
+        );
+        assert_eq!(asleep["result"]["agents"][0]["state"], json!("asleep"));
+
+        let pruned = handle(
+            &mut core,
+            json!({
+                "id": "pruned",
+                "method": "bus.presence",
+                "params": {"workspace_root": "/repo", "now": 1000.0},
+            }),
+        );
+        assert_eq!(pruned["result"]["agents"], json!([]));
+
+        handle(
+            &mut core,
+            json!({
+                "id": "prompt",
+                "method": "bus.append",
+                "params": {
+                    "workspace_root": "/repo",
+                    "event_type": "user.prompt",
+                    "agent_id": "main-thread",
+                    "metadata": {"prompt_count": 2},
+                    "now": 100.0,
+                },
+            }),
+        );
+        let pinned = handle(
+            &mut core,
+            json!({
+                "id": "pinned",
+                "method": "bus.presence",
+                "params": {"workspace_root": "/repo", "now": 1000.0},
+            }),
+        );
+
+        assert_eq!(pinned["result"]["agents"][0]["agent_id"], json!("main-thread"));
+        assert_eq!(pinned["result"]["agents"][0]["state"], json!("asleep"));
+        assert_eq!(pinned["result"]["agents"][0]["pinned"], json!(true));
+    }
+
+    #[test]
+    fn bus_weather_and_status_include_presence_count() {
+        let mut core = BrokerCore::new_at(10.0);
+        handle(
+            &mut core,
+            json!({
+                "id": "started",
+                "method": "bus.append",
+                "params": {
+                    "workspace_root": "/repo",
+                    "event_type": "agent.started",
+                    "agent_id": "agent-now",
+                    "now": 100.0,
+                },
+            }),
+        );
+
+        let weather = handle(
+            &mut core,
+            json!({
+                "id": "weather",
+                "method": "bus.weather",
+                "params": {"workspace_root": "/repo", "now": 100.0},
+            }),
+        );
+        let status = handle(&mut core, json!({"id": "status", "method": "status"}));
+        let bus_status = handle(
+            &mut core,
+            json!({
+                "id": "bus-status",
+                "method": "bus.status",
+                "params": {"now": 100.0},
+            }),
+        );
+
+        assert_eq!(weather["result"]["agents"][0]["agent_id"], json!("agent-now"));
+        assert_eq!(weather["result"]["status"]["agent_count"], json!(1));
+        assert_eq!(bus_status["result"]["agent_count"], json!(1));
+        assert!(status["result"]["bus"].get("agent_count").is_some());
     }
 
     #[test]

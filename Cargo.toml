@@ -1,0 +1,15 @@
+[package]
+name = "hsp"
+version = "0.1.0"
+edition = "2024"
+authors = ["nuck"]
+description = "Rust rewrite of the Harness Server Protocol"
+license = "MIT"
+
+[dependencies]
+orgmap = { path = "../orgmap" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

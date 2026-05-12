@@ -8,3 +8,4 @@ description = "Agent bus policy for HSP"
 
 [dependencies]
 hsp-wire.workspace = true
+serde.workspace = true

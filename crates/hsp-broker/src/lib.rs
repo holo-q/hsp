@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hsp_bus::BusJournal;
+use hsp_bus::{BusJournal, EditGateMode, TicketBoard, TicketIntent};
 use hsp_session::{SessionKey, SessionRegistry};
+use hsp_wire::BusScope;
 use hsp_wire::{BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerWireError};
 use serde_json::{Value, json};
 
@@ -10,6 +11,7 @@ pub struct BrokerCore {
     started_at: f64,
     registry: SessionRegistry,
     bus: BusJournal,
+    tickets: TicketBoard,
     shutting_down: bool,
 }
 
@@ -23,6 +25,7 @@ impl BrokerCore {
             started_at,
             registry: SessionRegistry::new(),
             bus: BusJournal::new(),
+            tickets: TicketBoard::new(),
             shutting_down: false,
         }
     }
@@ -49,6 +52,12 @@ impl BrokerCore {
             "session.get_or_create" => self.session_get_or_create(&request),
             "session.list" => Ok(json!(self.session_records())),
             "session.stop" => self.session_stop(&request),
+            "bus.status" => Ok(json!({
+                "event_count": self.bus.events().len(),
+            })),
+            "bus.ticket" => self.bus_ticket(&request),
+            "bus.build_gate" => self.bus_build_gate(&request),
+            "bus.edit_gate" => self.bus_edit_gate(&request),
             method => Err(BrokerWireError::new(
                 BrokerErrorCode::UnknownMethod,
                 format!("unknown method: {method}"),
@@ -111,6 +120,46 @@ impl BrokerCore {
         let session_id = required_string(&request.params, "session_id")?;
         Ok(json!({"stopped": self.registry.stop(&session_id)}))
     }
+
+    fn bus_ticket(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let workspace_root = workspace_root(&request.params);
+        let agent_id = agent_id(&request.params);
+        let message = optional_string(&request.params, "message")?.unwrap_or_default();
+        let mut intent = TicketIntent::new(workspace_root.clone(), agent_id.clone(), message);
+        intent.scope = scope_from_params(&request.params);
+        intent.projects = project_roots(&request.params);
+        intent.now = optional_f64(&request.params, "now")?.unwrap_or(0.0);
+
+        let ticket = self.tickets.hold(intent);
+        Ok(json!({
+            "ticket": ticket,
+            "active_tickets": self.tickets.active_tickets(&workspace_root),
+        }))
+    }
+
+    fn bus_build_gate(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let workspace_root = workspace_root(&request.params);
+        let agent_id = agent_id(&request.params);
+        let gate = self.tickets.build_gate(
+            workspace_root,
+            (!agent_id.is_empty()).then_some(agent_id.as_str()),
+            scope_from_params(&request.params),
+            project_roots(&request.params),
+            optional_bool(&request.params, "full_workspace")?.unwrap_or(false),
+        );
+        serde_json::to_value(gate).map_err(internal_error)
+    }
+
+    fn bus_edit_gate(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let workspace_root = workspace_root(&request.params);
+        let agent_id = agent_id(&request.params);
+        let mode = match optional_string(&request.params, "mode")?.as_deref() {
+            Some("agent") => EditGateMode::Agent,
+            _ => EditGateMode::Workgroup,
+        };
+        serde_json::to_value(self.tickets.edit_gate(workspace_root, agent_id, mode))
+            .map_err(internal_error)
+    }
 }
 
 impl Default for BrokerCore {
@@ -146,6 +195,87 @@ fn optional_string(
             BrokerErrorCode::InvalidParams,
             format!("{name} must be a string"),
         )),
+    }
+}
+
+fn optional_bool(
+    params: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<bool>, BrokerWireError> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        _ => Err(BrokerWireError::new(
+            BrokerErrorCode::InvalidParams,
+            format!("{name} must be a boolean"),
+        )),
+    }
+}
+
+fn optional_f64(
+    params: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<f64>, BrokerWireError> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value.as_f64().map(Some).ok_or_else(|| {
+            BrokerWireError::new(BrokerErrorCode::InvalidParams, format!("{name} must be a number"))
+        }),
+        _ => Err(BrokerWireError::new(
+            BrokerErrorCode::InvalidParams,
+            format!("{name} must be a number"),
+        )),
+    }
+}
+
+fn workspace_root(params: &serde_json::Map<String, Value>) -> String {
+    params
+        .get("workspace_root")
+        .or_else(|| params.get("root"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn agent_id(params: &serde_json::Map<String, Value>) -> String {
+    ["agent_id", "client_id", "session_id"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn scope_from_params(params: &serde_json::Map<String, Value>) -> BusScope {
+    BusScope {
+        files: strings(params.get("files")),
+        symbols: strings(params.get("symbols")),
+        aliases: strings(params.get("aliases")),
+    }
+}
+
+fn project_roots(params: &serde_json::Map<String, Value>) -> Vec<String> {
+    let roots = strings(params.get("project_roots"));
+    if roots.is_empty() {
+        strings(params.get("projects"))
+    } else {
+        roots
+    }
+}
+
+fn strings(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(value)) => value
+            .replace(',', " ")
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -286,5 +416,97 @@ mod tests {
 
         assert_eq!(response, json!({"id": 17, "result": {"shutting_down": true}}));
         assert!(core.is_shutting_down());
+    }
+
+    #[test]
+    fn bus_ticket_and_build_gate_round_trip() {
+        let mut core = BrokerCore::new_at(10.0);
+        handle(
+            &mut core,
+            json!({
+                "id": "t1",
+                "method": "bus.ticket",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-a", "message": "edit server"},
+            }),
+        );
+        handle(
+            &mut core,
+            json!({
+                "id": "t2",
+                "method": "bus.ticket",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-b", "message": "edit server"},
+            }),
+        );
+
+        let cold = handle(
+            &mut core,
+            json!({"id": "g1", "method": "bus.build_gate", "params": {"workspace_root": "/repo"}}),
+        );
+        let one_waiting = handle(
+            &mut core,
+            json!({
+                "id": "g2",
+                "method": "bus.build_gate",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-a"},
+            }),
+        );
+        let all_waiting = handle(
+            &mut core,
+            json!({
+                "id": "g3",
+                "method": "bus.build_gate",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-b"},
+            }),
+        );
+
+        assert_eq!(cold["result"]["reason"], json!("active_tickets"));
+        assert_eq!(cold["result"]["unlocked"], json!(false));
+        assert_eq!(one_waiting["result"]["unlocked"], json!(false));
+        assert_eq!(all_waiting["result"]["reason"], json!("all_waiting"));
+        assert_eq!(all_waiting["result"]["unlocked"], json!(true));
+    }
+
+    #[test]
+    fn bus_edit_gate_respects_workgroup_and_agent_modes() {
+        let mut core = BrokerCore::new_at(10.0);
+        let denied = handle(
+            &mut core,
+            json!({
+                "id": "e1",
+                "method": "bus.edit_gate",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-a"},
+            }),
+        );
+        handle(
+            &mut core,
+            json!({
+                "id": "t1",
+                "method": "bus.ticket",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-b", "message": "editing"},
+            }),
+        );
+        let workgroup = handle(
+            &mut core,
+            json!({
+                "id": "e2",
+                "method": "bus.edit_gate",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-a"},
+            }),
+        );
+        let agent = handle(
+            &mut core,
+            json!({
+                "id": "e3",
+                "method": "bus.edit_gate",
+                "params": {"workspace_root": "/repo", "agent_id": "agent-b", "mode": "agent"},
+            }),
+        );
+
+        assert_eq!(denied["result"]["allowed"], json!(false));
+        assert_eq!(denied["result"]["reason"], json!("missing_ticket"));
+        assert_eq!(workgroup["result"]["allowed"], json!(true));
+        assert_eq!(workgroup["result"]["reason"], json!("ticket_active"));
+        assert_eq!(agent["result"]["allowed"], json!(true));
+        assert_eq!(agent["result"]["reason"], json!("ticket_held"));
     }
 }

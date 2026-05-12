@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use hsp_wire::BusScope;
+use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Ticket {
     pub ticket_id: String,
     pub message: String,
@@ -20,7 +21,7 @@ impl Ticket {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TicketIntent {
     pub workspace_root: String,
     pub agent_id: String,
@@ -47,7 +48,7 @@ impl TicketIntent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BuildGate {
     pub workspace_root: String,
     pub gate_key: String,
@@ -67,7 +68,7 @@ pub enum EditGateMode {
     Agent,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EditGate {
     pub workspace_root: String,
     pub allowed: bool,

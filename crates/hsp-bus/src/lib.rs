@@ -105,6 +105,7 @@ pub struct BusJournal {
     events: Vec<BusEvent>,
     questions: BTreeMap<String, BusQuestion>,
     presence: PresenceTracker,
+    next_event_seq: u64,
     next_question_id: u64,
 }
 
@@ -114,6 +115,7 @@ impl Default for BusJournal {
             events: Vec::new(),
             questions: BTreeMap::new(),
             presence: PresenceTracker::new(),
+            next_event_seq: 1,
             next_question_id: 1,
         }
     }
@@ -132,8 +134,17 @@ impl BusJournal {
         Self::default()
     }
 
+    pub fn from_events(events: impl IntoIterator<Item = BusEvent>) -> Self {
+        let mut journal = Self::new();
+        for event in events {
+            journal.absorb_replayed(event);
+        }
+        journal
+    }
+
     pub fn append(&mut self, append: JournalAppend) -> &BusEvent {
-        let seq = self.events.len() as u64 + 1;
+        let seq = self.next_event_seq;
+        self.next_event_seq += 1;
         let clipped = truncate_message(&append.message, MAX_MESSAGE_BYTES);
 
         self.events.push(BusEvent {
@@ -503,6 +514,53 @@ impl BusJournal {
             .cloned()
             .collect()
     }
+
+    fn absorb_replayed(&mut self, event: BusEvent) {
+        self.next_event_seq = self.next_event_seq.max(event.seq + 1);
+        self.track_question_id(&event.question_id);
+        match event.kind {
+            BusEventKind::BusAsk if !event.question_id.is_empty() => {
+                self.questions.insert(
+                    event.question_id.clone(),
+                    BusQuestion {
+                        question_id: event.question_id.clone(),
+                        opened_event_id: event.event_id.clone(),
+                        opened_at: event.timestamp,
+                        expires_at: event.timestamp + timeout_seconds_from(&event),
+                        workspace_root: event.workspace_root.clone(),
+                        agent_id: event.agent_id.clone(),
+                        scope: event.scope.clone(),
+                        message: event.message.clone(),
+                        closed_at: None,
+                        replies: Vec::new(),
+                    },
+                );
+            }
+            BusEventKind::BusReply if !event.question_id.is_empty() => {
+                if let Some(question) = self.questions.get_mut(&event.question_id) {
+                    question.replies.push(event.seq);
+                }
+            }
+            BusEventKind::BusClosed if !event.question_id.is_empty() => {
+                if let Some(question) = self.questions.get_mut(&event.question_id) {
+                    question.closed_at = Some(event.timestamp);
+                }
+            }
+            _ => {}
+        }
+        self.presence.observe(&event);
+        self.events.push(event);
+    }
+
+    fn track_question_id(&mut self, question_id: &str) {
+        let Some(index) = question_id.strip_prefix('Q') else {
+            return;
+        };
+        let Ok(index) = index.parse::<u64>() else {
+            return;
+        };
+        self.next_question_id = self.next_question_id.max(index + 1);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +614,15 @@ fn same_or_descendant(child: &str, parent: &str) -> bool {
 
 fn normalize_root(root: &str) -> String {
     root.trim().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn timeout_seconds_from(event: &BusEvent) -> f64 {
+    event
+        .metadata
+        .get("timeout_seconds")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(180.0)
+        .max(0.0)
 }
 
 #[cfg(test)]
@@ -756,5 +823,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["umbrella", "domain"]
         );
+    }
+
+    #[test]
+    fn replay_rehydrates_sequence_questions_and_presence() {
+        let mut journal = BusJournal::new();
+        let mut ask = JournalAppend::new(BusEventKind::BusAsk);
+        ask.timestamp = 100.0;
+        ask.workspace_root = "/repo".to_string();
+        ask.agent_id = "agent-a".to_string();
+        ask.message = "coordinate?".to_string();
+        let (_event, question) = journal.ask(ask, QuestionOpen::new(1.0));
+
+        let mut reply = JournalAppend::new(BusEventKind::BusReply);
+        reply.timestamp = 100.5;
+        reply.workspace_root = "/repo".to_string();
+        reply.agent_id = "agent-b".to_string();
+        reply.message = "yes".to_string();
+        journal
+            .reply(&question.question_id, reply, false)
+            .expect("reply");
+
+        let base = JournalAppend::new(BusEventKind::BusClosed);
+        journal.settle("/repo", 101.0, &base);
+
+        let mut replayed = BusJournal::from_events(journal.events().to_vec());
+        let question = replayed.question("Q1").expect("question rehydrated");
+        assert_eq!(question.closed_at, Some(101.0));
+        assert_eq!(question.replies, vec![2]);
+        assert_eq!(
+            replayed
+                .visible_presence_for_workspace("/repo", 101.0)
+                .iter()
+                .map(|entry| entry.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-a", "agent-b"]
+        );
+
+        let event = replayed.append(JournalAppend::new(BusEventKind::NotePosted));
+        assert_eq!(event.seq, 4);
     }
 }

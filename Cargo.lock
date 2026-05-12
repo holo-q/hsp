@@ -188,9 +188,9 @@ version = "0.1.0"
 dependencies = [
  "hsp-bus",
  "hsp-session",
+ "hsp-store",
  "hsp-wire",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "hsp-wire",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -9,6 +9,6 @@ description = "Broker request dispatch for HSP"
 [dependencies]
 hsp-bus.workspace = true
 hsp-session.workspace = true
+hsp-store.workspace = true
 hsp-wire.workspace = true
 serde_json.workspace = true
-sha2.workspace = true

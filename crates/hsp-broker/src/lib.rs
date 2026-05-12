@@ -9,7 +9,6 @@ use hsp_session::{SessionKey, SessionRegistry};
 use hsp_wire::{BusEventKind, BusScope};
 use hsp_wire::{BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerWireError};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct BrokerCore {
@@ -854,11 +853,7 @@ fn bounded_limit(
 }
 
 fn workspace_id(workspace_root: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(workspace_root.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
-    hex[..12].to_string()
+    hsp_store::workspace_id_for(workspace_root).unwrap_or_default()
 }
 
 fn question_close_value(close: &QuestionClose, now: f64) -> Value {

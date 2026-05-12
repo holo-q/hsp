@@ -1,0 +1,9 @@
+[package]
+name = "hsp-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Broker protocol path and environment policy for HSP"
+
+[dependencies]

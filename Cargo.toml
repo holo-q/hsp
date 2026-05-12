@@ -4,6 +4,7 @@ members = [
     "crates/hsp-broker",
     "crates/hsp-bus",
     "crates/hsp-org",
+    "crates/hsp-protocol",
     "crates/hsp-session",
     "crates/hsp-store",
     "crates/hsp-wire",
@@ -20,6 +21,7 @@ license = "MIT"
 hsp-broker = { path = "crates/hsp-broker" }
 hsp-bus = { path = "crates/hsp-bus" }
 hsp-org = { path = "crates/hsp-org" }
+hsp-protocol = { path = "crates/hsp-protocol" }
 hsp-session = { path = "crates/hsp-session" }
 hsp-store = { path = "crates/hsp-store" }
 hsp-wire = { path = "crates/hsp-wire" }
@@ -40,6 +42,7 @@ license.workspace = true
 hsp-broker.workspace = true
 hsp-bus.workspace = true
 hsp-org.workspace = true
+hsp-protocol.workspace = true
 hsp-session.workspace = true
 hsp-store.workspace = true
 hsp-wire.workspace = true

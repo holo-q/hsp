@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use hsp_wire::BusScope;
+use hsp_wire::{BusEvent, BusEventKind, BusScope};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -111,6 +111,60 @@ impl TicketBoard {
         Self {
             next_ticket_id: 1,
             ..Self::default()
+        }
+    }
+
+    pub fn from_events(events: impl IntoIterator<Item = BusEvent>) -> Self {
+        let mut board = Self::new();
+        for event in events {
+            board.absorb_event(&event);
+        }
+        board
+    }
+
+    pub fn absorb_event(&mut self, event: &BusEvent) {
+        self.track_ticket_id(event);
+        let Some(ticket_id) = event.metadata.get("ticket_id").filter(|id| !id.is_empty()) else {
+            return;
+        };
+
+        match event.kind {
+            BusEventKind::TicketStarted | BusEventKind::TicketJoined => {
+                let ticket = self.tickets.entry(ticket_id.clone()).or_insert_with(|| Ticket {
+                    ticket_id: ticket_id.clone(),
+                    message: event.message.clone(),
+                    workspace_root: event.workspace_root.clone(),
+                    opened_at: event.timestamp,
+                    closed_at: None,
+                    holders: BTreeMap::new(),
+                    scope: event.scope.clone(),
+                    projects: projects_from_event(event),
+                });
+                ticket.closed_at = None;
+                ticket.message = event.message.clone();
+                merge_scope(&mut ticket.scope, &event.scope);
+                merge_items(&mut ticket.projects, &projects_from_event(event));
+                if !event.agent_id.is_empty() {
+                    ticket.holders.insert(event.agent_id.clone(), event.timestamp);
+                    self.agent_tickets
+                        .insert(event.agent_id.clone(), ticket_id.clone());
+                }
+            }
+            BusEventKind::TicketReleased => {
+                if let Some(ticket) = self.tickets.get_mut(ticket_id) {
+                    ticket.holders.remove(&event.agent_id);
+                }
+                self.agent_tickets.remove(&event.agent_id);
+            }
+            BusEventKind::TicketClosed => {
+                if let Some(ticket) = self.tickets.get_mut(ticket_id) {
+                    ticket.closed_at = Some(event.timestamp);
+                    ticket.holders.clear();
+                }
+                self.agent_tickets
+                    .retain(|_agent_id, held_ticket_id| held_ticket_id != ticket_id);
+            }
+            _ => {}
         }
     }
 
@@ -385,6 +439,33 @@ impl TicketBoard {
             !waiters.is_empty()
         });
     }
+
+    fn track_ticket_id(&mut self, event: &BusEvent) {
+        let Some(ticket_id) = event.metadata.get("ticket_id") else {
+            return;
+        };
+        let Some(index) = ticket_id.strip_prefix('T') else {
+            return;
+        };
+        let Ok(index) = index.parse::<u64>() else {
+            return;
+        };
+        self.next_ticket_id = self.next_ticket_id.max(index + 1);
+    }
+}
+
+fn projects_from_event(event: &BusEvent) -> Vec<String> {
+    event.metadata
+        .get("projects")
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .replace([',', '\n'], " ")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn merge_scope(target: &mut BusScope, incoming: &BusScope) {
@@ -466,10 +547,45 @@ fn suffix_prefix_overlaps(left: &[&str], right: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use hsp_wire::{BusEvent, SCHEMA_VERSION};
+
     use super::*;
 
     fn intent(agent_id: &str, message: &str) -> TicketIntent {
         TicketIntent::new("/repo", agent_id, message)
+    }
+
+    fn ticket_event(
+        seq: u64,
+        kind: BusEventKind,
+        ticket_id: &str,
+        agent_id: &str,
+        message: &str,
+    ) -> BusEvent {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("ticket_id".to_string(), ticket_id.to_string());
+        BusEvent {
+            seq,
+            event_id: format!("E{seq}"),
+            kind,
+            timestamp: seq as f64,
+            workspace_id: "wsid".to_string(),
+            workspace_root: "/repo".to_string(),
+            agent_id: agent_id.to_string(),
+            client_id: "cli".to_string(),
+            session_id: String::new(),
+            task_id: String::new(),
+            git_head: String::new(),
+            dirty_hash: String::new(),
+            scope: BusScope::parse("src/lib.rs", "", ""),
+            message: message.to_string(),
+            metadata,
+            question_id: String::new(),
+            truncated: false,
+            schema_version: SCHEMA_VERSION,
+        }
     }
 
     #[test]
@@ -505,6 +621,28 @@ mod tests {
         assert_eq!(ticket.ticket_id, "T1");
         assert_eq!(board.active_tickets("/repo").len(), 1);
         assert_eq!(ticket.scope.files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn replayed_ticket_events_rehydrate_active_holders_and_next_id() {
+        let board = TicketBoard::from_events([
+            ticket_event(1, BusEventKind::TicketStarted, "T4", "agent-a", "rewrite"),
+            ticket_event(2, BusEventKind::TicketJoined, "T4", "agent-b", "rewrite"),
+            ticket_event(3, BusEventKind::TicketReleased, "T4", "agent-a", "rewrite"),
+        ]);
+
+        let active = board.active_tickets("/repo");
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].holders.keys().cloned().collect::<Vec<_>>(),
+            vec!["agent-b"]
+        );
+
+        let mut board = board;
+        let fresh = board
+            .hold(TicketIntent::new("/repo", "agent-c", "new lane"))
+            .expect("fresh ticket");
+        assert_eq!(fresh.ticket_id, "T5");
     }
 
     #[test]

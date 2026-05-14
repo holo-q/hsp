@@ -137,7 +137,7 @@ impl BusJournal {
     pub fn from_events(events: impl IntoIterator<Item = BusEvent>) -> Self {
         let mut journal = Self::new();
         for event in events {
-            journal.absorb_replayed(event);
+            journal.absorb_event(event);
         }
         journal
     }
@@ -515,7 +515,7 @@ impl BusJournal {
             .collect()
     }
 
-    fn absorb_replayed(&mut self, event: BusEvent) {
+    pub fn absorb_event(&mut self, event: BusEvent) {
         self.next_event_seq = self.next_event_seq.max(event.seq + 1);
         self.track_question_id(&event.question_id);
         match event.kind {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hsp_bus::{
@@ -6,7 +7,8 @@ use hsp_bus::{
     TicketIntent,
 };
 use hsp_session::{SessionKey, SessionRegistry};
-use hsp_wire::{BusEventKind, BusScope};
+use hsp_store::{BrokerMode, BusLog};
+use hsp_wire::{BusEvent, BusEventKind, BusScope};
 use hsp_wire::{BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerWireError};
 use serde_json::{Value, json};
 
@@ -16,12 +18,16 @@ pub struct BrokerCore {
     registry: SessionRegistry,
     bus: BusJournal,
     tickets: TicketBoard,
+    loaded_workspaces: BTreeSet<String>,
+    persistence_enabled: bool,
     shutting_down: bool,
 }
 
 impl BrokerCore {
     pub fn new() -> Self {
-        Self::new_at(now_seconds())
+        let mut core = Self::new_at(now_seconds());
+        core.persistence_enabled = true;
+        core
     }
 
     pub fn new_at(started_at: f64) -> Self {
@@ -30,6 +36,8 @@ impl BrokerCore {
             registry: SessionRegistry::new(),
             bus: BusJournal::new(),
             tickets: TicketBoard::new(),
+            loaded_workspaces: BTreeSet::new(),
+            persistence_enabled: false,
             shutting_down: false,
         }
     }
@@ -139,7 +147,9 @@ impl BrokerCore {
         })
     }
 
-    fn bus_status(&self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+    fn bus_status(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         Ok(self.bus_status_value(now_from_params(&request.params)?))
     }
 
@@ -161,6 +171,7 @@ impl BrokerCore {
 
     fn bus_ticket(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let workspace_root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&workspace_root)?;
         let agent_id = agent_id(&request.params);
         let message = optional_string(&request.params, "message")?.unwrap_or_default();
         let mut intent = TicketIntent::new(workspace_root.clone(), agent_id.clone(), message);
@@ -185,7 +196,12 @@ impl BrokerCore {
             append
                 .metadata
                 .insert("ticket_id".to_string(), effect.ticket.ticket_id.clone());
-            self.bus.append(append);
+            if !effect.ticket.projects.is_empty() {
+                append
+                    .metadata
+                    .insert("projects".to_string(), effect.ticket.projects.join(" "));
+            }
+            self.append_durable(append)?;
         }
         Ok(json!({
             "ticket": hold.ticket,
@@ -209,8 +225,13 @@ impl BrokerCore {
                 })?
             }
         };
-        let event = self.bus.append(journal_append_from_params(&request.params, kind)?);
-        serde_json::to_value(json!({"event": BusEventWire::from(event)})).map_err(internal_error)
+        let workspace_root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&workspace_root)?;
+        let mut append = journal_append_from_params(&request.params, kind)?;
+        append.workspace_root = workspace_root;
+        append.workspace_id = workspace_id(&append.workspace_root);
+        let event = self.append_durable(append)?;
+        serde_json::to_value(json!({"event": BusEventWire::from(&event)})).map_err(internal_error)
     }
 
     fn bus_chat(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
@@ -223,7 +244,11 @@ impl BrokerCore {
 
     fn bus_heartbeat(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let now = now_from_params(&request.params)?;
+        let workspace_root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&workspace_root)?;
         let mut append = journal_append_from_params(&request.params, BusEventKind::AgentHeartbeat)?;
+        append.workspace_root = workspace_root;
+        append.workspace_id = workspace_id(&append.workspace_root);
         append.timestamp = now;
         let agent = self
             .bus
@@ -235,6 +260,7 @@ impl BrokerCore {
 
     fn bus_presence(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let now = now_from_params(&request.params)?;
         let include_pruned = optional_bool(&request.params, "include_pruned")?.unwrap_or(false);
         let entries = if include_pruned {
@@ -255,6 +281,7 @@ impl BrokerCore {
 
     fn bus_ask(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let busy_agents = busy_agent_ids(&self.tickets.active_tickets(&root));
         let no_repliers = busy_agents.is_empty();
         let mut open = QuestionOpen::new(timeout_seconds(&request.params)?);
@@ -262,6 +289,7 @@ impl BrokerCore {
         let (event, question) = self
             .bus
             .ask(journal_append_from_params(&request.params, BusEventKind::BusAsk)?, open);
+        self.persist_event(&event)?;
         let now = event.timestamp;
         Ok(json!({
             "event": BusEventWire::from(&event),
@@ -289,6 +317,8 @@ impl BrokerCore {
                 "reply requires id or question_id",
             ));
         }
+        let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let (event, question) = self
             .bus
             .reply(
@@ -299,6 +329,7 @@ impl BrokerCore {
             .map_err(|error| {
                 BrokerWireError::new(BrokerErrorCode::InvalidParams, error.to_string())
             })?;
+        self.persist_event(&event)?;
         Ok(json!({
             "event": BusEventWire::from(&event),
             "question": question.to_wire(event.timestamp),
@@ -313,6 +344,8 @@ impl BrokerCore {
                 "question requires id or question_id",
             ));
         }
+        let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let now = now_from_params(&request.params)?;
         let question = self.bus.question(&question_id).ok_or_else(|| {
             BrokerWireError::new(
@@ -334,9 +367,10 @@ impl BrokerCore {
 
     fn bus_recent(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let query = event_query_from_params(&request.params, DEFAULT_RECENT_LIMIT)?;
+        self.ensure_workspace_loaded(&query.workspace_root)?;
         let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
-        self.bus.settle(&query.workspace_root, now, &append);
+        self.settle_durable(&query.workspace_root, now, &append)?;
         let events = self.bus.recent(&query);
         let selected_count = events.len();
         let truncated = self.bus.recent_is_truncated(&query, selected_count);
@@ -370,6 +404,7 @@ impl BrokerCore {
     }
 
     fn bus_recent_all(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        self.ensure_workspace_loaded(&workspace_root(&request.params))?;
         let after_seq = optional_u64(&request.params, "after_id")?.unwrap_or(0);
         let limit = bounded_limit(&request.params, DEFAULT_RECENT_LIMIT, 200)?;
         let events = self
@@ -387,6 +422,9 @@ impl BrokerCore {
 
     fn bus_recent_tree(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let roots = workspace_roots(&request.params);
+        for root in &roots {
+            self.ensure_workspace_loaded(root)?;
+        }
         let after_seq = optional_u64(&request.params, "after_id")?.unwrap_or(0);
         let limit = bounded_limit(&request.params, DEFAULT_RECENT_LIMIT, 200)?;
         let events = self
@@ -405,9 +443,10 @@ impl BrokerCore {
 
     fn bus_journal(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
-        self.bus.settle(&root, now, &append);
+        self.settle_durable(&root, now, &append)?;
         let limit = bounded_limit(&request.params, DEFAULT_JOURNAL_LIMIT, 100)?;
         let events = self
             .bus
@@ -431,11 +470,11 @@ impl BrokerCore {
 
     fn bus_settle(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
         let closed = self
-            .bus
-            .settle(&root, now, &append)
+            .settle_durable(&root, now, &append)?
             .into_iter()
             .map(|close| question_close_value(&close, now))
             .collect::<Vec<_>>();
@@ -444,9 +483,10 @@ impl BrokerCore {
 
     fn bus_weather(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&root)?;
         let now = now_from_params(&request.params)?;
         let append = journal_append_from_params(&request.params, BusEventKind::BusClosed)?;
-        self.bus.settle(&root, now, &append);
+        self.settle_durable(&root, now, &append)?;
         let events = self
             .bus
             .events_for_workspace(&root, 10)
@@ -477,6 +517,7 @@ impl BrokerCore {
 
     fn bus_precommit(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let mut query = event_query_from_params(&request.params, 10)?;
+        self.ensure_workspace_loaded(&query.workspace_root)?;
         if query.limit == DEFAULT_RECENT_LIMIT {
             query.limit = 10;
         }
@@ -495,6 +536,7 @@ impl BrokerCore {
 
     fn bus_build_gate(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let workspace_root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&workspace_root)?;
         let agent_id = agent_id(&request.params);
         let gate = self.tickets.build_gate(
             workspace_root,
@@ -508,6 +550,7 @@ impl BrokerCore {
 
     fn bus_edit_gate(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let workspace_root = workspace_root(&request.params);
+        self.ensure_workspace_loaded(&workspace_root)?;
         let agent_id = agent_id(&request.params);
         let mode = match optional_string(&request.params, "mode")?.as_deref() {
             Some("agent") => EditGateMode::Agent,
@@ -515,6 +558,52 @@ impl BrokerCore {
         };
         serde_json::to_value(self.tickets.edit_gate(workspace_root, agent_id, mode))
             .map_err(internal_error)
+    }
+
+    fn ensure_workspace_loaded(&mut self, workspace_root: &str) -> Result<(), BrokerWireError> {
+        if self.loaded_workspaces.contains(workspace_root) {
+            return Ok(());
+        }
+        if !self.persistence_enabled {
+            self.loaded_workspaces.insert(workspace_root.to_string());
+            return Ok(());
+        }
+        let log = bus_log(workspace_root)?;
+        for event in log.replay().map_err(transport_error)? {
+            self.tickets.absorb_event(&event);
+            self.bus.absorb_event(event);
+        }
+        self.loaded_workspaces.insert(workspace_root.to_string());
+        Ok(())
+    }
+
+    fn append_durable(&mut self, append: JournalAppend) -> Result<BusEvent, BrokerWireError> {
+        let event = self.bus.append(append).clone();
+        self.tickets.absorb_event(&event);
+        self.persist_event(&event)?;
+        Ok(event)
+    }
+
+    fn persist_event(&self, event: &BusEvent) -> Result<(), BrokerWireError> {
+        if !self.persistence_enabled {
+            return Ok(());
+        }
+        bus_log(&event.workspace_root)?
+            .append(event)
+            .map_err(transport_error)
+    }
+
+    fn settle_durable(
+        &mut self,
+        workspace_root: &str,
+        now: f64,
+        append: &JournalAppend,
+    ) -> Result<Vec<QuestionClose>, BrokerWireError> {
+        let closed = self.bus.settle(workspace_root, now, append);
+        for close in &closed {
+            self.persist_event(&close.close_event)?;
+        }
+        Ok(closed)
     }
 }
 
@@ -856,6 +945,12 @@ fn workspace_id(workspace_root: &str) -> String {
     hsp_store::workspace_id_for(workspace_root).unwrap_or_default()
 }
 
+fn bus_log(workspace_root: &str) -> Result<BusLog, BrokerWireError> {
+    let path =
+        hsp_store::log_path_for(workspace_root, BrokerMode::Broker).map_err(transport_error)?;
+    BusLog::new(path).map_err(transport_error)
+}
+
 fn question_close_value(close: &QuestionClose, now: f64) -> Value {
     let events = close
         .events
@@ -877,6 +972,10 @@ fn question_close_value(close: &QuestionClose, now: f64) -> Value {
 
 fn internal_error(error: serde_json::Error) -> BrokerWireError {
     BrokerWireError::new(BrokerErrorCode::Internal, error.to_string())
+}
+
+fn transport_error(error: std::io::Error) -> BrokerWireError {
+    BrokerWireError::new(BrokerErrorCode::Transport, error.to_string())
 }
 
 fn now_seconds() -> f64 {

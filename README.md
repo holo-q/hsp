@@ -16,7 +16,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `crates/hsp-daemon` owns the `hsp-broker` Unix socket runtime around `BrokerCore`; it does not own dispatch semantics.
 - `crates/hsp-session` owns broker session identity and registry state. It does not start language servers.
 - `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, event wire views, ticket lifecycle transitions, questions/replies/settle digests, decaying presence, build gates, and edit gates. It can rehydrate from replayed events but does not know where they came from.
-- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates; persistence wiring and LSP supervision come later.
+- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates. It lazily replays per-workspace JSONL logs through `hsp-store`, persists every durable bus row, and leaves heartbeat live-only.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` / `src/cli.rs` are the CLI adapter. They keep argument parsing and broker-friendly defaults out of the core crates while exposing workgroup probes, broker lifecycle commands, and `hsp log ...` bus actions.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.
@@ -25,7 +25,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 
 1. Keep `hsp-wire` data-first and preserve JSON shape before adding runtime behavior.
 2. Grow `hsp-bus` from pure journal policy into tickets, questions, presence, and gates while keeping storage behind `hsp-store`. Ticket transitions and question closes now emit durable-shaped event rows through the same journal path as ordinary bus events, and every durable event updates the derived presence view.
-3. Wire `hsp-store` into broker/runtime after the in-memory bus contract is pinned; append/recent/journal shapes should not change when JSONL replay lands. The store now owns `workspace_id_for`, `bus_dir_for`, and `log_path_for`; the bus owns `from_events` rehydration.
+3. Wire `hsp-store` into broker/runtime after the in-memory bus contract is pinned; append/recent/journal shapes should not change when JSONL replay lands. The store now owns `workspace_id_for`, `bus_dir_for`, and `log_path_for`; the bus owns event/ticket rehydration; the broker owns lazy workspace replay and durable append timing.
 4. Add daemon/client socket runtime on top of `hsp-protocol`, keeping socket serving and sync client transport outside `hsp-broker` dispatch. `hsp-client` and `hsp-daemon` now cover the synchronous client, daemon socket runtime, and `hsp-broker` binary skeleton.
 5. Restore the user-facing bus surface through the Rust CLI. `hsp log <action>` now reaches broker bus methods for event/note/ask/reply/chat/ticket/journal/question/recent/settle/precommit/postcommit/weather/presence/status/build_gate/edit_gate and supplies stable CLI agent/client defaults.
 6. Port LSP routing/session management as a runtime crate, not as DTO residue.

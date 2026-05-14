@@ -26,7 +26,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 
 ## Display Clients
 
-- [`bob-hsp`](https://github.com/holo-q/bob-hsp) is the Bob desktop feed for Rust HSP bus weather. It reads the Rust broker through `hsp-client`, publishes `plugin.hsp` feed snapshots into `bobd`, and keeps HSP coordination visible beside Babel sessions, jobs, and orgmap without linking HSP policy into the Bob host.
+- [`bob-hsp`](https://github.com/holo-q/bob-hsp) is the Bob desktop feed for Rust HSP bus weather. It reads the Rust broker through `hsp-client`, publishes `plugin.hsp` feed snapshots into `bobd`, and keeps HSP coordination visible beside Babel sessions, jobs, and orgmap without linking HSP policy into the Bob host. Ticket row actions close tickets through the broker and append durable manual `ticket.closed` markers for later agents sampling bus history.
 
 ## Parity Path
 

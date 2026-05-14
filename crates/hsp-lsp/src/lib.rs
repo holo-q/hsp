@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
@@ -345,6 +345,7 @@ pub struct LspClient {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     capabilities: Value,
+    open_documents: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -410,6 +411,7 @@ impl LspClient {
             stdout: BufReader::new(stdout),
             next_id: 1,
             capabilities: Value::Null,
+            open_documents: HashSet::new(),
         };
         let initialized = client.request("initialize", initialize_params(&client.root_path)?)?;
         client.capabilities = initialized
@@ -433,6 +435,9 @@ impl LspClient {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, LspClientError> {
+        if method.starts_with("textDocument/") {
+            self.ensure_document_for_params(&params)?;
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.write_message(&json!({
@@ -477,6 +482,37 @@ impl LspClient {
         let frame = encode_lsp_message(message)?;
         self.stdin.write_all(&frame)?;
         self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn ensure_document_for_params(&mut self, params: &Value) -> Result<(), LspClientError> {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(Value::as_object)
+            .and_then(|text_document| text_document.get("uri"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(());
+        };
+        if self.open_documents.contains(uri) {
+            return Ok(());
+        }
+        let path = path_from_file_uri(uri).ok_or_else(|| {
+            LspClientError::Protocol(format!("textDocument uri is not a file URI: {uri}"))
+        })?;
+        let text = std::fs::read_to_string(&path)?;
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id_for_path(&path),
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )?;
+        self.open_documents.insert(uri.to_string());
         Ok(())
     }
 }
@@ -713,6 +749,42 @@ fn is_empty_lsp_result(result: &Value) -> bool {
     }
 }
 
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    Some(PathBuf::from(percent_decode_path(raw)?))
+}
+
+fn percent_decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = bytes.get(index + 1).copied()?;
+            let lo = bytes.get(index + 2).copied()?;
+            decoded.push(hex_byte(hi, lo)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    Some(hex_nibble(hi)? << 4 | hex_nibble(lo)?)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn split_args(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(str::to_string).collect()
 }
@@ -868,6 +940,15 @@ mod tests {
             json!(true)
         );
         assert!(params["rootUri"].as_str().unwrap().starts_with("file://"));
+    }
+
+    #[test]
+    fn file_uri_path_round_trip_decodes_percent_escapes() {
+        let path = PathBuf::from("a path.rs");
+        let uri = file_uri(&path).unwrap();
+        let decoded = path_from_file_uri(&uri).unwrap();
+
+        assert!(decoded.ends_with("a path.rs"));
     }
 
     #[test]

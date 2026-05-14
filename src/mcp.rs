@@ -194,6 +194,31 @@ fn tools_list() -> Value {
                         "mode": {"type": "string", "default": ""}
                     },
                 },
+            },
+            {
+                "name": "lsp_session",
+                "description": "Inspect the broker-owned LSP runtime.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": {"type": "string", "default": "status"},
+                        "path": {"type": "string", "default": ""},
+                        "server": {"type": "string", "default": ""}
+                    },
+                },
+            },
+            {
+                "name": "lsp_outline",
+                "description": "Show compact document symbols for one source file.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "file_path": {"type": "string", "default": ""},
+                        "pattern": {"type": "string", "default": ""}
+                    },
+                },
             }
         ],
     })
@@ -221,6 +246,8 @@ fn call_tool(request: &Map<String, Value>) -> McpResult<Value> {
         "ask" => call_ask(&arguments),
         "chat" => call_chat(&arguments),
         "lsp_memory" | "memory" => call_lsp_memory(&arguments),
+        "lsp_session" | "session" => call_lsp_session(&arguments),
+        "lsp_outline" | "outline" => call_lsp_outline(&arguments),
         other => Ok(tool_error_text(format!("unknown HSP tool: {other}"))),
     }
 }
@@ -413,10 +440,193 @@ fn call_lsp_memory(arguments: &Map<String, Value>) -> McpResult<Value> {
     Ok(tool_text("hsp/memory", text, false))
 }
 
+fn call_lsp_session(arguments: &Map<String, Value>) -> McpResult<Value> {
+    let action = arg_string(arguments, "action")
+        .filter(|action| !action.is_empty())
+        .unwrap_or_else(|| "status".to_string())
+        .to_ascii_lowercase();
+    if action != "status" {
+        return Ok(tool_error_text(format!(
+            "Rust lsp_session currently supports action=\"status\"; got {action:?}."
+        )));
+    }
+    Ok(tool_text(
+        "hsp/session",
+        render_lsp_status(&broker_request("lsp.status", Map::new())?),
+        false,
+    ))
+}
+
+fn call_lsp_outline(arguments: &Map<String, Value>) -> McpResult<Value> {
+    let file_path = arg_string(arguments, "file_path")
+        .filter(|path| !path.is_empty())
+        .or_else(|| arg_string(arguments, "path").filter(|path| !path.is_empty()))
+        .ok_or_else(|| mcp_error("lsp_outline requires file_path"))?;
+    let path = std::path::PathBuf::from(&file_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let uri = hsp::file_uri(&path)?;
+    let mut params = Map::new();
+    params.insert("root".to_string(), json!(workspace_root(arguments)?));
+    params.insert(
+        "lsp_method".to_string(),
+        json!("textDocument/documentSymbol"),
+    );
+    params.insert(
+        "lsp_params".to_string(),
+        json!({
+            "textDocument": {
+                "uri": uri,
+            },
+        }),
+    );
+    params.insert(
+        "empty_fallback_methods".to_string(),
+        json!(["textDocument/documentSymbol"]),
+    );
+    let result = broker_request("lsp.request", params)?;
+    Ok(tool_text(
+        "textDocument/documentSymbol",
+        render_outline_result(&path, &result),
+        false,
+    ))
+}
+
 fn journal_after(arguments: &Map<String, Value>, params: &Map<String, Value>) -> McpResult<Value> {
     let mut journal_params = params.clone();
     journal_params.insert("limit".to_string(), json!(arg_u64(arguments, "limit", 25)));
     Ok(broker_request("bus.journal", journal_params)?)
+}
+
+fn render_lsp_status(result: &Value) -> String {
+    if !result
+        .get("configured")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return format!("lsp: unconfigured\n{}", value_str(result, "error"));
+    }
+    if let Some(runtime) = result.get("runtime").filter(|value| !value.is_null()) {
+        let chain = value_array(runtime, "chain");
+        let clients = value_array(runtime, "clients");
+        let mut lines = vec![format!(
+            "lsp runtime root={} requests={}",
+            value_str(runtime, "root"),
+            runtime
+                .get("request_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        )];
+        for client in clients {
+            lines.push(format!(
+                "  {} started={}",
+                value_str(client, "server_label"),
+                client
+                    .get("started")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            ));
+        }
+        if clients.is_empty() {
+            for server in chain {
+                lines.push(format!("  {}", value_str(server, "label")));
+            }
+        }
+        return lines.join("\n");
+    }
+    let mut lines = vec!["lsp: configured".to_string()];
+    for server in value_array(result, "chain") {
+        lines.push(format!(
+            "  {} {}",
+            value_str(server, "command"),
+            string_list(server, "args").join(" ")
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_outline_result(path: &std::path::Path, result: &Value) -> String {
+    let server = value_str(result, "server_label");
+    let symbols = result
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if symbols.is_empty() {
+        return format!("{}: no document symbols ({server})", path.display());
+    }
+    let mut lines = vec![format!("{} ({server})", path.display())];
+    render_document_symbols(&symbols, 0, &mut lines);
+    lines.join("\n")
+}
+
+fn render_document_symbols(symbols: &[Value], depth: usize, lines: &mut Vec<String>) {
+    for symbol in symbols {
+        let name = value_str(symbol, "name");
+        let kind = symbol.get("kind").and_then(Value::as_u64).unwrap_or(0);
+        let line = lsp_symbol_line(symbol).unwrap_or(0);
+        lines.push(format!(
+            "L{line}  {}{} {}",
+            "  ".repeat(depth),
+            lsp_symbol_kind_label(kind),
+            name
+        ));
+        if let Some(children) = symbol.get("children").and_then(Value::as_array) {
+            render_document_symbols(children, depth + 1, lines);
+        }
+    }
+}
+
+fn lsp_symbol_line(symbol: &Value) -> Option<u64> {
+    symbol
+        .get("range")
+        .or_else(|| {
+            symbol
+                .get("location")
+                .and_then(Value::as_object)
+                .and_then(|location| location.get("range"))
+        })
+        .and_then(Value::as_object)
+        .and_then(|range| range.get("start"))
+        .and_then(Value::as_object)
+        .and_then(|start| start.get("line"))
+        .and_then(Value::as_u64)
+        .map(|line| line + 1)
+}
+
+fn lsp_symbol_kind_label(kind: u64) -> &'static str {
+    match kind {
+        1 => "File ",
+        2 => "Module ",
+        3 => "Namespace ",
+        4 => "Package ",
+        5 => "Class ",
+        6 => "Method ",
+        7 => "Property ",
+        8 => "Field ",
+        9 => "Constructor ",
+        10 => "Enum ",
+        11 => "Interface ",
+        12 => "Function ",
+        13 => "Variable ",
+        14 => "Constant ",
+        15 => "String ",
+        16 => "Number ",
+        17 => "Boolean ",
+        18 => "Array ",
+        19 => "Object ",
+        20 => "Key ",
+        21 => "Null ",
+        22 => "EnumMember ",
+        23 => "Struct ",
+        24 => "Event ",
+        25 => "Operator ",
+        26 => "TypeParameter ",
+        _ => "Symbol ",
+    }
 }
 
 fn render_memory_status(result: &Value) -> String {
@@ -1157,7 +1367,16 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["lsp_log", "ticket", "journal", "ask", "chat", "lsp_memory"]
+            vec![
+                "lsp_log",
+                "ticket",
+                "journal",
+                "ask",
+                "chat",
+                "lsp_memory",
+                "lsp_session",
+                "lsp_outline"
+            ]
         );
     }
 

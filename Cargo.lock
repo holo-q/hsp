@@ -193,6 +193,7 @@ name = "hsp-broker"
 version = "0.1.0"
 dependencies = [
  "hsp-bus",
+ "hsp-render",
  "hsp-session",
  "hsp-store",
  "hsp-wire",

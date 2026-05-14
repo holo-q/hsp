@@ -6,6 +6,7 @@ use hsp_bus::{
     EventQuery, JournalAppend, QuestionClose, QuestionOpen, TicketBoard, TicketEffectKind,
     TicketIntent,
 };
+use hsp_render::{AliasIdentity, AliasKind, AliasRecord, AliasResolution, RenderMemory};
 use hsp_session::{SessionKey, SessionRegistry};
 use hsp_store::{BrokerMode, WorkspaceStore};
 use hsp_wire::{BusEvent, BusEventKind, BusScope};
@@ -18,6 +19,7 @@ pub struct BrokerCore {
     registry: SessionRegistry,
     bus: BusJournal,
     tickets: TicketBoard,
+    render: RenderMemory,
     loaded_workspaces: BTreeSet<String>,
     store: Option<WorkspaceStore>,
     shutting_down: bool,
@@ -38,6 +40,7 @@ impl BrokerCore {
             registry: SessionRegistry::new(),
             bus: BusJournal::new(),
             tickets: TicketBoard::new(),
+            render: RenderMemory::new(),
             loaded_workspaces: BTreeSet::new(),
             store: None,
             shutting_down: false,
@@ -78,6 +81,11 @@ impl BrokerCore {
             "session.get_or_create" => self.session_get_or_create(&request),
             "session.list" => Ok(json!(self.session_records())),
             "session.stop" => self.session_stop(&request),
+            "render.status" => Ok(self.render_status()),
+            "render.touch" => self.render_touch(&request),
+            "render.lookup" => self.render_lookup(&request),
+            "render.reset_session" => Ok(self.render_reset_session()),
+            "render.reset_client" => Ok(self.render_reset_session()),
             "bus.status" => self.bus_status(&request),
             "bus.append" | "bus.event" => self.bus_event(&request, None),
             "bus.note" => self.bus_event(&request, Some(BusEventKind::NotePosted)),
@@ -181,6 +189,49 @@ impl BrokerCore {
     fn session_stop(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let session_id = required_string(&request.params, "session_id")?;
         Ok(json!({"stopped": self.registry.stop(&session_id)}))
+    }
+
+    fn render_status(&self) -> Value {
+        json!({
+            "epoch_id": self.render.epoch_id(),
+            "generation": self.render.generation(),
+        })
+    }
+
+    fn render_touch(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let identities = request
+            .params
+            .get("identities")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BrokerWireError::new(
+                    BrokerErrorCode::InvalidParams,
+                    "render.touch requires identities array",
+                )
+            })?;
+        let mut records = Vec::new();
+        for identity in identities {
+            records.push(self.render.touch(alias_identity_from_value(identity)?));
+        }
+        let legend = self.render.aliases_for_response(&records, true);
+        Ok(json!({
+            "records": records.iter().map(alias_record_value).collect::<Vec<_>>(),
+            "legend": legend,
+            "status": self.render_status(),
+        }))
+    }
+
+    fn render_lookup(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let token = required_string(&request.params, "token")?;
+        Ok(alias_resolution_value(self.render.lookup(&token)))
+    }
+
+    fn render_reset_session(&mut self) -> Value {
+        self.render.clear_epoch();
+        json!({
+            "reset": true,
+            "status": self.render_status(),
+        })
     }
 
     fn bus_ticket(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
@@ -717,6 +768,131 @@ fn optional_u64(
     }
 }
 
+fn alias_identity_from_value(value: &Value) -> Result<AliasIdentity, BrokerWireError> {
+    let object = value.as_object().ok_or_else(|| {
+        BrokerWireError::new(
+            BrokerErrorCode::InvalidParams,
+            "render identity must be an object",
+        )
+    })?;
+    let kind = match object
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("symbol")
+    {
+        "symbol" | "Symbol" => AliasKind::Symbol,
+        "file" | "File" => AliasKind::File,
+        "type" | "Type" => AliasKind::Type,
+        other => {
+            return Err(BrokerWireError::new(
+                BrokerErrorCode::InvalidParams,
+                format!("unknown render alias kind: {other}"),
+            ));
+        }
+    };
+    Ok(AliasIdentity {
+        kind,
+        name: object_string(object, "name"),
+        path: object_string(object, "path"),
+        line: object_u32(object, "line")?,
+        character: object_u32(object, "character")?,
+        symbol_kind: object_string(object, "symbol_kind"),
+        workspace_root: object_string(object, "workspace_root"),
+        server_label: object_string(object, "server_label"),
+        bucket_key: object_string(object, "bucket_key"),
+        bucket_label: object_string(object, "bucket_label"),
+    })
+}
+
+fn alias_record_value(record: &AliasRecord) -> Value {
+    json!({
+        "alias": record.alias,
+        "bucket": record.bucket,
+        "member_index": record.member_index,
+        "kind": alias_kind_name(record.kind),
+        "identity": alias_identity_value(&record.identity),
+        "generation": record.generation,
+        "epoch_id": record.epoch_id,
+    })
+}
+
+fn alias_resolution_value(resolution: AliasResolution) -> Value {
+    match (resolution.record, resolution.error) {
+        (Some(record), _) => json!({
+            "ok": true,
+            "record": alias_record_value(&record),
+        }),
+        (None, Some(error)) => json!({
+            "ok": false,
+            "error": alias_error_name(error),
+            "message": resolution.message,
+        }),
+        (None, None) => json!({
+            "ok": false,
+            "error": "unknown",
+            "message": resolution.message,
+        }),
+    }
+}
+
+fn alias_identity_value(identity: &AliasIdentity) -> Value {
+    json!({
+        "kind": alias_kind_name(identity.kind),
+        "name": identity.name,
+        "path": identity.path,
+        "line": identity.line,
+        "character": identity.character,
+        "symbol_kind": identity.symbol_kind,
+        "workspace_root": identity.workspace_root,
+        "server_label": identity.server_label,
+        "bucket_key": identity.bucket_key,
+        "bucket_label": identity.bucket_label,
+    })
+}
+
+fn alias_kind_name(kind: AliasKind) -> &'static str {
+    match kind {
+        AliasKind::Symbol => "symbol",
+        AliasKind::File => "file",
+        AliasKind::Type => "type",
+    }
+}
+
+fn alias_error_name(error: hsp_render::AliasError) -> &'static str {
+    match error {
+        hsp_render::AliasError::Unknown => "unknown",
+        hsp_render::AliasError::Stale => "stale",
+        hsp_render::AliasError::Invalid => "invalid",
+    }
+}
+
+fn object_string(object: &serde_json::Map<String, Value>, name: &str) -> String {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn object_u32(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<u32, BrokerWireError> {
+    match object.get(name) {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(number)) => number.as_u64().map(|value| value as u32).ok_or_else(|| {
+            BrokerWireError::new(
+                BrokerErrorCode::InvalidParams,
+                format!("{name} must be an unsigned integer"),
+            )
+        }),
+        _ => Err(BrokerWireError::new(
+            BrokerErrorCode::InvalidParams,
+            format!("{name} must be an unsigned integer"),
+        )),
+    }
+}
+
 fn workspace_root(params: &serde_json::Map<String, Value>) -> String {
     let raw = params
         .get("workspace_root")
@@ -1086,6 +1262,69 @@ mod tests {
     #[test]
     fn workspace_id_matches_bus_registry_sha256_prefix() {
         assert_eq!(workspace_id("/repo"), "816fc349d3fa");
+    }
+
+    #[test]
+    fn render_touch_lookup_and_reset_round_trip() {
+        let mut core = BrokerCore::ephemeral_at(10.0);
+        let touched = handle(
+            &mut core,
+            json!({
+                "id": "r1",
+                "method": "render.touch",
+                "params": {
+                    "identities": [
+                        {
+                            "kind": "symbol",
+                            "name": "render",
+                            "path": "src/view.rs",
+                            "line": 10,
+                            "bucket_key": "View",
+                            "bucket_label": "view.rs::View"
+                        }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(touched["result"]["records"][0]["alias"], json!("A1"));
+        assert_eq!(
+            touched["result"]["legend"],
+            json!("legend+ gen=1:\n  A=view.rs::View  A1=render@L10")
+        );
+
+        let looked_up = handle(
+            &mut core,
+            json!({
+                "id": "r2",
+                "method": "render.lookup",
+                "params": {"token": "[A1]"},
+            }),
+        );
+        assert_eq!(looked_up["result"]["ok"], json!(true));
+        assert_eq!(
+            looked_up["result"]["record"]["identity"]["name"],
+            json!("render")
+        );
+
+        let reset = handle(
+            &mut core,
+            json!({
+                "id": "r3",
+                "method": "render.reset_session",
+                "params": {},
+            }),
+        );
+        assert_eq!(reset["result"]["status"]["epoch_id"], json!(1));
+        let stale = handle(
+            &mut core,
+            json!({
+                "id": "r4",
+                "method": "render.lookup",
+                "params": {"token": "A1"},
+            }),
+        );
+        assert_eq!(stale["result"]["error"], json!("unknown"));
     }
 
     #[test]

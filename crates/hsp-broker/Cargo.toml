@@ -8,6 +8,7 @@ description = "Broker request dispatch for HSP"
 
 [dependencies]
 hsp-bus.workspace = true
+hsp-lsp.workspace = true
 hsp-render.workspace = true
 hsp-session.workspace = true
 hsp-store.workspace = true

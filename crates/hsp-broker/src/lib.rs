@@ -6,6 +6,7 @@ use hsp_bus::{
     EventQuery, JournalAppend, QuestionClose, QuestionOpen, TicketBoard, TicketEffectKind,
     TicketIntent,
 };
+use hsp_lsp::LspRuntime;
 use hsp_render::{AliasIdentity, AliasKind, AliasRecord, AliasResolution, RenderMemory};
 use hsp_session::{SessionKey, SessionRegistry};
 use hsp_store::{BrokerMode, WorkspaceStore};
@@ -13,13 +14,14 @@ use hsp_wire::{BusEvent, BusEventKind, BusScope};
 use hsp_wire::{BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerWireError};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BrokerCore {
     started_at: f64,
     registry: SessionRegistry,
     bus: BusJournal,
     tickets: TicketBoard,
     render: RenderMemory,
+    lsp: Option<LspRuntime>,
     loaded_workspaces: BTreeSet<String>,
     store: Option<WorkspaceStore>,
     shutting_down: bool,
@@ -41,6 +43,7 @@ impl BrokerCore {
             bus: BusJournal::new(),
             tickets: TicketBoard::new(),
             render: RenderMemory::new(),
+            lsp: None,
             loaded_workspaces: BTreeSet::new(),
             store: None,
             shutting_down: false,
@@ -81,6 +84,8 @@ impl BrokerCore {
             "session.get_or_create" => self.session_get_or_create(&request),
             "session.list" => Ok(json!(self.session_records())),
             "session.stop" => self.session_stop(&request),
+            "lsp.status" => Ok(self.lsp_status()),
+            "lsp.request" => self.lsp_request(&request),
             "render.status" => Ok(self.render_status()),
             "render.touch" => self.render_touch(&request),
             "render.lookup" => self.render_lookup(&request),
@@ -189,6 +194,63 @@ impl BrokerCore {
     fn session_stop(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
         let session_id = required_string(&request.params, "session_id")?;
         Ok(json!({"stopped": self.registry.stop(&session_id)}))
+    }
+
+    fn lsp_status(&self) -> Value {
+        match &self.lsp {
+            Some(runtime) => json!({
+                "configured": true,
+                "runtime": runtime.status(),
+            }),
+            None => match hsp_lsp::parse_chain_from_env() {
+                Ok(chain) => json!({
+                    "configured": true,
+                    "runtime": null,
+                    "chain": chain.iter().map(|server| {
+                        json!({
+                            "command": server.command,
+                            "args": server.args,
+                            "name": server.name,
+                            "label": server.label,
+                        })
+                    }).collect::<Vec<_>>(),
+                }),
+                Err(error) => json!({
+                    "configured": false,
+                    "error": error.to_string(),
+                }),
+            },
+        }
+    }
+
+    fn lsp_request(&mut self, request: &BrokerRequest) -> Result<Value, BrokerWireError> {
+        let root = required_string(&request.params, "root")?;
+        let method = required_string(&request.params, "lsp_method")?;
+        let params = request
+            .params
+            .get("lsp_params")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let empty_fallback_methods = strings(request.params.get("empty_fallback_methods"));
+        let runtime = self.ensure_lsp_runtime(&root)?;
+        let result = runtime
+            .request(&method, params, &empty_fallback_methods)
+            .map_err(|error| BrokerWireError::new(BrokerErrorCode::Internal, error.to_string()))?;
+        Ok(result.to_wire())
+    }
+
+    fn ensure_lsp_runtime(&mut self, root: &str) -> Result<&mut LspRuntime, BrokerWireError> {
+        let replace = self
+            .lsp
+            .as_ref()
+            .is_none_or(|runtime| runtime.root_path().to_string_lossy() != root);
+        if replace {
+            let runtime = LspRuntime::from_env(root).map_err(|error| {
+                BrokerWireError::new(BrokerErrorCode::InvalidParams, error.to_string())
+            })?;
+            self.lsp = Some(runtime);
+        }
+        Ok(self.lsp.as_mut().expect("runtime initialized"))
     }
 
     fn render_status(&self) -> Value {
@@ -1328,6 +1390,25 @@ mod tests {
             }),
         );
         assert_eq!(stale["result"]["error"], json!("unknown"));
+    }
+
+    #[test]
+    fn lsp_status_reports_unconfigured_without_starting_runtime() {
+        let mut core = BrokerCore::ephemeral_at(10.0);
+        let status = handle(
+            &mut core,
+            json!({
+                "id": "lsp",
+                "method": "lsp.status",
+                "params": {},
+            }),
+        );
+
+        assert_eq!(status["result"]["configured"], json!(false));
+        assert!(status["result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("LSP_SERVERS or LSP_COMMAND"));
     }
 
     #[test]

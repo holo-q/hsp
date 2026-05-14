@@ -221,6 +221,7 @@ dependencies = [
  "hsp-broker",
  "hsp-client",
  "hsp-protocol",
+ "hsp-store",
  "hsp-wire",
  "serde_json",
 ]

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hsp_broker::BrokerCore;
+use hsp_store::{BrokerMode, WorkspaceStore};
 use hsp_wire::{BrokerErrorCode, BrokerResponse, BrokerWireError, decode_message_str, encode_message};
 use serde_json::Value;
 
@@ -27,7 +28,10 @@ impl ServeOptions {
 }
 
 pub fn serve_default() -> Result<(), BrokerWireError> {
-    serve_unix(ServeOptions::from_default_path(), BrokerCore::new())
+    serve_unix(
+        ServeOptions::from_default_path(),
+        BrokerCore::with_store(WorkspaceStore::new(BrokerMode::Broker)),
+    )
 }
 
 pub fn serve_unix(options: ServeOptions, mut core: BrokerCore) -> Result<(), BrokerWireError> {
@@ -120,7 +124,7 @@ mod tests {
     }
 
     fn start_server(path: PathBuf) -> thread::JoinHandle<Result<(), BrokerWireError>> {
-        thread::spawn(move || serve_unix(ServeOptions::new(path), BrokerCore::new()))
+        thread::spawn(move || serve_unix(ServeOptions::new(path), BrokerCore::ephemeral()))
     }
 
     fn params(items: &[(&str, &str)]) -> Map<String, serde_json::Value> {

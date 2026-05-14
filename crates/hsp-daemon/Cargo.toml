@@ -9,6 +9,7 @@ description = "Unix socket broker daemon runtime for HSP"
 [dependencies]
 hsp-broker.workspace = true
 hsp-protocol.workspace = true
+hsp-store.workspace = true
 hsp-wire.workspace = true
 serde_json.workspace = true
 

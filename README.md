@@ -9,14 +9,14 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 ## Architecture
 
 - `crates/hsp-wire` owns serializable DTOs and wire invariants. It must stay light: no async runtime, storage, LSP, TUI, or parser stacks.
-- `crates/hsp-store` owns persistence and row mapping only. JSONL append/replay, workspace id hashing, and bus directory policy live here, not in bus policy.
+- `crates/hsp-store` owns persistence and row mapping only. JSONL append/replay, workspace id hashing, bus directory policy, and the `WorkspaceStore` broker-facing persistence handle live here, not in bus policy.
 - `crates/hsp-org` owns HSP's facade over `orgmap`; workgroup parsing and hierarchy discovery remain outside HSP.
 - `crates/hsp-protocol` owns broker path and environment policy: socket path resolution, broker log path resolution, and idle TTL defaults. It is pure and has no runtime dependency.
 - `crates/hsp-client` owns synchronous JSONL-over-UnixStream requests and broker auto-start.
 - `crates/hsp-daemon` owns the `hsp-broker` Unix socket runtime around `BrokerCore`; it does not own dispatch semantics.
 - `crates/hsp-session` owns broker session identity and registry state. It does not start language servers.
 - `crates/hsp-bus` owns agent-bus policy over `hsp-wire` events: sequence handles, truncation, scope filtering, event wire views, ticket lifecycle transitions, questions/replies/settle digests, decaying presence, build gates, and edit gates. It can rehydrate from replayed events but does not know where they came from.
-- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates. It lazily replays per-workspace JSONL logs through `hsp-store`, persists every durable bus row, and leaves heartbeat live-only.
+- `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates. It accepts an optional `WorkspaceStore`, lazily replays per-workspace JSONL logs through `hsp-store`, persists every durable bus row, and leaves heartbeat live-only.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` / `src/cli.rs` are the CLI adapter. They keep argument parsing and broker-friendly defaults out of the core crates while exposing workgroup probes, broker lifecycle commands, `hsp log ...` bus actions, stdin hook recording, build-gated `hsp run`, `hsp watch`, and broker-global status.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.

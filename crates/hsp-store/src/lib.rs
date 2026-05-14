@@ -113,6 +113,37 @@ impl BusLog {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceStore {
+    mode: BrokerMode,
+}
+
+impl WorkspaceStore {
+    pub fn new(mode: BrokerMode) -> Self {
+        Self { mode }
+    }
+
+    pub fn mode(&self) -> BrokerMode {
+        self.mode
+    }
+
+    pub fn log_for(&self, workspace_root: impl AsRef<Path>) -> std::io::Result<BusLog> {
+        BusLog::new(log_path_for(workspace_root, self.mode)?)
+    }
+
+    pub fn replay(&self, workspace_root: impl AsRef<Path>) -> std::io::Result<Vec<BusEvent>> {
+        self.log_for(workspace_root)?.replay()
+    }
+
+    pub fn append(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        event: &BusEvent,
+    ) -> std::io::Result<()> {
+        self.log_for(workspace_root)?.append(event)
+    }
+}
+
 fn absolute_path(root: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let root = root.as_ref();
     let path = if root.is_absolute() {
@@ -252,6 +283,23 @@ mod tests {
         log.append(&second).expect("append second");
 
         assert_eq!(log.replay().expect("replay"), vec![first, second]);
+    }
+
+    #[test]
+    fn workspace_store_wraps_mode_and_bus_log_policy() {
+        let base = std::env::current_dir()
+            .expect("current dir")
+            .join("target/hsp-store-tests")
+            .join(format!("workspace-store-{}", std::process::id()));
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).expect("root dir");
+
+        let store = WorkspaceStore::new(BrokerMode::Direct);
+        store.append(&root, &event(1, "stored")).expect("append");
+        let replayed = store.replay(&root).expect("replay");
+        assert_eq!(store.mode(), BrokerMode::Direct);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].message, "stored");
     }
 
     #[test]

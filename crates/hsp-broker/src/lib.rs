@@ -7,7 +7,7 @@ use hsp_bus::{
     TicketIntent,
 };
 use hsp_session::{SessionKey, SessionRegistry};
-use hsp_store::{BrokerMode, BusLog};
+use hsp_store::{BrokerMode, WorkspaceStore};
 use hsp_wire::{BusEvent, BusEventKind, BusScope};
 use hsp_wire::{BrokerErrorCode, BrokerRequest, BrokerResponse, BrokerWireError};
 use serde_json::{Value, json};
@@ -19,27 +19,41 @@ pub struct BrokerCore {
     bus: BusJournal,
     tickets: TicketBoard,
     loaded_workspaces: BTreeSet<String>,
-    persistence_enabled: bool,
+    store: Option<WorkspaceStore>,
     shutting_down: bool,
 }
 
 impl BrokerCore {
     pub fn new() -> Self {
-        let mut core = Self::new_at(now_seconds());
-        core.persistence_enabled = true;
-        core
+        Self::with_store(WorkspaceStore::new(BrokerMode::Broker))
     }
 
-    pub fn new_at(started_at: f64) -> Self {
+    pub fn ephemeral() -> Self {
+        Self::ephemeral_at(now_seconds())
+    }
+
+    pub fn ephemeral_at(started_at: f64) -> Self {
         Self {
             started_at,
             registry: SessionRegistry::new(),
             bus: BusJournal::new(),
             tickets: TicketBoard::new(),
             loaded_workspaces: BTreeSet::new(),
-            persistence_enabled: false,
+            store: None,
             shutting_down: false,
         }
+    }
+
+    pub fn with_store(store: WorkspaceStore) -> Self {
+        let mut core = Self::ephemeral();
+        core.store = Some(store);
+        core
+    }
+
+    pub fn with_store_at(started_at: f64, store: WorkspaceStore) -> Self {
+        let mut core = Self::ephemeral_at(started_at);
+        core.store = Some(store);
+        core
     }
 
     pub fn handle_value(&mut self, value: Value) -> BrokerResponse {
@@ -564,12 +578,11 @@ impl BrokerCore {
         if self.loaded_workspaces.contains(workspace_root) {
             return Ok(());
         }
-        if !self.persistence_enabled {
+        let Some(store) = &self.store else {
             self.loaded_workspaces.insert(workspace_root.to_string());
             return Ok(());
-        }
-        let log = bus_log(workspace_root)?;
-        for event in log.replay().map_err(transport_error)? {
+        };
+        for event in store.replay(workspace_root).map_err(transport_error)? {
             self.tickets.absorb_event(&event);
             self.bus.absorb_event(event);
         }
@@ -585,11 +598,11 @@ impl BrokerCore {
     }
 
     fn persist_event(&self, event: &BusEvent) -> Result<(), BrokerWireError> {
-        if !self.persistence_enabled {
+        let Some(store) = &self.store else {
             return Ok(());
-        }
-        bus_log(&event.workspace_root)?
-            .append(event)
+        };
+        store
+            .append(&event.workspace_root, event)
             .map_err(transport_error)
     }
 
@@ -945,12 +958,6 @@ fn workspace_id(workspace_root: &str) -> String {
     hsp_store::workspace_id_for(workspace_root).unwrap_or_default()
 }
 
-fn bus_log(workspace_root: &str) -> Result<BusLog, BrokerWireError> {
-    let path =
-        hsp_store::log_path_for(workspace_root, BrokerMode::Broker).map_err(transport_error)?;
-    BusLog::new(path).map_err(transport_error)
-}
-
 fn question_close_value(close: &QuestionClose, now: f64) -> Value {
     let events = close
         .events
@@ -987,6 +994,9 @@ fn now_seconds() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use serde_json::{Map, json};
 
     use super::*;
@@ -999,9 +1009,45 @@ mod tests {
         response["error"].as_object().expect("error object")
     }
 
+    struct BusDirGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl BusDirGuard {
+        fn set(path: PathBuf) -> Self {
+            let prior = std::env::var_os(hsp_store::BUS_DIR_ENV);
+            unsafe {
+                std::env::set_var(hsp_store::BUS_DIR_ENV, path);
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for BusDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var(hsp_store::BUS_DIR_ENV, value),
+                    None => std::env::remove_var(hsp_store::BUS_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    fn test_bus_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::current_dir()
+            .expect("current dir")
+            .join("target/hsp-broker-tests")
+            .join(format!("{name}-{}-{stamp}", std::process::id()))
+    }
+
     #[test]
     fn ping_returns_pong() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         assert_eq!(
             handle(&mut core, json!({"id": "c1", "method": "ping"})),
             json!({"id": "c1", "result": {"pong": true}})
@@ -1010,7 +1056,7 @@ mod tests {
 
     #[test]
     fn status_response_shape_matches_python_broker() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let response = handle(&mut core, json!({"id": "c2", "method": "status"}));
         let result = response["result"].as_object().expect("result object");
 
@@ -1043,8 +1089,89 @@ mod tests {
     }
 
     #[test]
+    fn persistent_broker_replays_events_tickets_and_questions() {
+        let _guard = BusDirGuard::set(test_bus_dir("persistent-replay"));
+        let root = "/repo-persistent-replay";
+        let store = WorkspaceStore::new(BrokerMode::Broker);
+        let mut first = BrokerCore::with_store_at(10.0, store);
+
+        handle(
+            &mut first,
+            json!({
+                "id": "ticket",
+                "method": "bus.ticket",
+                "params": {
+                    "workspace_root": root,
+                    "agent_id": "agent-a",
+                    "message": "persistent ticket",
+                    "files": "src/lib.rs",
+                    "now": 100.0
+                }
+            }),
+        );
+        handle(
+            &mut first,
+            json!({
+                "id": "ask",
+                "method": "bus.ask",
+                "params": {
+                    "workspace_root": root,
+                    "agent_id": "agent-b",
+                    "message": "still here?",
+                    "timeout": "60s",
+                    "now": 101.0
+                }
+            }),
+        );
+        handle(
+            &mut first,
+            json!({
+                "id": "note",
+                "method": "bus.note",
+                "params": {
+                    "workspace_root": root,
+                    "agent_id": "agent-b",
+                    "message": "persist me",
+                    "now": 102.0
+                }
+            }),
+        );
+        drop(first);
+
+        let mut second = BrokerCore::with_store_at(20.0, store);
+        let journal = handle(
+            &mut second,
+            json!({
+                "id": "journal",
+                "method": "bus.journal",
+                "params": {"workspace_root": root, "now": 103.0}
+            }),
+        );
+        let kinds = journal["result"]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|event| event["event_type"].as_str().expect("event_type"))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["ticket.started", "bus.ask", "note.posted"]);
+        assert_eq!(journal["result"]["active_tickets"][0]["ticket_id"], json!("T1"));
+        assert_eq!(journal["result"]["open_questions"][0]["question_id"], json!("Q1"));
+
+        let gate = handle(
+            &mut second,
+            json!({
+                "id": "gate",
+                "method": "bus.build_gate",
+                "params": {"workspace_root": root, "files": "src/lib.rs"}
+            }),
+        );
+        assert_eq!(gate["result"]["unlocked"], json!(false));
+        assert_eq!(gate["result"]["holders"], json!(["agent-a"]));
+    }
+
+    #[test]
     fn malformed_requests_return_structured_errors() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
 
         let response = handle(&mut core, json!({"id": "c3", "method": "does_not_exist"}));
         assert_eq!(error(&response)["code"], json!("unknown_method"));
@@ -1058,7 +1185,7 @@ mod tests {
 
     #[test]
     fn session_get_or_create_reuses_records() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let request = json!({
             "id": "c7",
             "method": "session.get_or_create",
@@ -1077,7 +1204,7 @@ mod tests {
 
     #[test]
     fn session_get_or_create_requires_root_and_hash() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let response = handle(
             &mut core,
             json!({"id": "c6", "method": "session.get_or_create", "params": {}}),
@@ -1087,7 +1214,7 @@ mod tests {
 
     #[test]
     fn session_list_and_stop_use_registry() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let created = handle(
             &mut core,
             json!({
@@ -1111,7 +1238,7 @@ mod tests {
 
     #[test]
     fn shutdown_sets_state_and_response_id_is_echoed() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let response = handle(&mut core, json!({"id": 17, "method": "shutdown"}));
 
         assert_eq!(response, json!({"id": 17, "result": {"shutting_down": true}}));
@@ -1120,7 +1247,7 @@ mod tests {
 
     #[test]
     fn bus_ticket_and_build_gate_round_trip() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1176,7 +1303,7 @@ mod tests {
 
     #[test]
     fn bus_append_recent_and_workspace_scoping_match_python_contract() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         for (root, message) in [("/repo/a", "alpha"), ("/repo/b", "beta"), ("/repo/a", "gamma")] {
             handle(
                 &mut core,
@@ -1217,7 +1344,7 @@ mod tests {
 
     #[test]
     fn bus_journal_records_ticket_transitions_as_events() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         for agent_id in ["agent-a", "agent-b"] {
             handle(
                 &mut core,
@@ -1278,7 +1405,7 @@ mod tests {
 
     #[test]
     fn bus_precommit_suggests_targets_from_test_ran_metadata() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1303,7 +1430,7 @@ mod tests {
 
     #[test]
     fn bus_ask_reply_settle_and_question_round_trip() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1382,7 +1509,7 @@ mod tests {
 
     #[test]
     fn bus_ask_without_busy_agents_closes_immediately() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let opened = handle(
             &mut core,
             json!({
@@ -1414,7 +1541,7 @@ mod tests {
 
     #[test]
     fn bus_heartbeat_registers_presence_without_recent_event_noise() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let heartbeat = handle(
             &mut core,
             json!({
@@ -1453,7 +1580,7 @@ mod tests {
 
     #[test]
     fn bus_presence_decays_and_pins_prompt_threads() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1517,7 +1644,7 @@ mod tests {
 
     #[test]
     fn bus_weather_and_status_include_presence_count() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1558,7 +1685,7 @@ mod tests {
 
     #[test]
     fn bus_recent_all_and_recent_tree_cover_watch_surfaces() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         for (root, message) in [
             ("/workspace", "umbrella"),
             ("/workspace/domain", "domain"),
@@ -1613,7 +1740,7 @@ mod tests {
 
     #[test]
     fn bus_chat_with_question_id_records_reply_and_closes_question() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         handle(
             &mut core,
             json!({
@@ -1667,7 +1794,7 @@ mod tests {
 
     #[test]
     fn bus_edit_gate_respects_workgroup_and_agent_modes() {
-        let mut core = BrokerCore::new_at(10.0);
+        let mut core = BrokerCore::ephemeral_at(10.0);
         let denied = handle(
             &mut core,
             json!({

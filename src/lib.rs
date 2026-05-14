@@ -17,7 +17,7 @@ pub use hsp_protocol::{
 };
 pub use hsp_session::{BrokerSession, SessionKey, SessionRecord, SessionRegistry, config_hash};
 pub use hsp_store::{
-    BUS_DIR_ENV, BrokerMode, BusLog, LOG_FILE_NAME, WORKSPACE_ID_LENGTH, bus_dir_for,
-    log_path_for, workspace_id_for,
+    BUS_DIR_ENV, BrokerMode, BusLog, LOG_FILE_NAME, WORKSPACE_ID_LENGTH, WorkspaceStore,
+    bus_dir_for, log_path_for, workspace_id_for,
 };
 pub use hsp_wire::{BusEvent, BusEventKind, BusScope};

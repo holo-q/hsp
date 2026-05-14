@@ -181,6 +181,19 @@ fn tools_list() -> Value {
                     },
                     "required": ["message"],
                 },
+            },
+            {
+                "name": "lsp_memory",
+                "description": "Inspect and manage render-memory aliases.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": {"type": "string", "default": "status"},
+                        "target": {"type": "string", "default": ""},
+                        "mode": {"type": "string", "default": ""}
+                    },
+                },
             }
         ],
     })
@@ -207,6 +220,7 @@ fn call_tool(request: &Map<String, Value>) -> McpResult<Value> {
         "journal" => call_journal(&arguments),
         "ask" => call_ask(&arguments),
         "chat" => call_chat(&arguments),
+        "lsp_memory" | "memory" => call_lsp_memory(&arguments),
         other => Ok(tool_error_text(format!("unknown HSP tool: {other}"))),
     }
 }
@@ -362,10 +376,104 @@ fn call_chat(arguments: &Map<String, Value>) -> McpResult<Value> {
     ))
 }
 
+fn call_lsp_memory(arguments: &Map<String, Value>) -> McpResult<Value> {
+    let action = arg_string(arguments, "action")
+        .filter(|action| !action.is_empty())
+        .unwrap_or_else(|| "status".to_string())
+        .to_ascii_lowercase();
+    let text = match action.as_str() {
+        "status" => render_memory_status(&broker_request("render.status", Map::new())?),
+        "legend" => {
+            let status = broker_request("render.status", Map::new())?;
+            status
+                .get("legend")
+                .and_then(Value::as_str)
+                .filter(|legend| !legend.is_empty())
+                .unwrap_or("legend: (empty)")
+                .to_string()
+        }
+        "lookup" | "recall" => {
+            let target = arg_text(arguments, "target").trim();
+            if target.is_empty() {
+                return Ok(tool_error_text(format!(
+                    "action=\"{action}\" requires target=\"A1\""
+                )));
+            }
+            let mut params = Map::new();
+            params.insert("token".to_string(), json!(target));
+            render_memory_lookup(&broker_request("render.lookup", params)?)
+        }
+        "reset" => render_memory_status(&broker_request("render.reset_session", Map::new())?),
+        other => {
+            return Ok(tool_error_text(format!(
+                "Unknown memory action: {other:?}. Valid: status, legend, lookup, recall, reset."
+            )));
+        }
+    };
+    Ok(tool_text("hsp/memory", text, false))
+}
+
 fn journal_after(arguments: &Map<String, Value>, params: &Map<String, Value>) -> McpResult<Value> {
     let mut journal_params = params.clone();
     journal_params.insert("limit".to_string(), json!(arg_u64(arguments, "limit", 25)));
     Ok(broker_request("bus.journal", journal_params)?)
+}
+
+fn render_memory_status(result: &Value) -> String {
+    let status = result.get("status").unwrap_or(result);
+    let epoch = status.get("epoch_id").and_then(Value::as_u64).unwrap_or(0);
+    let generation = status
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let aliases = value_array(status, "aliases");
+    let mut lines = vec![format!(
+        "render memory epoch={epoch} gen={generation} aliases={}",
+        aliases.len()
+    )];
+    for alias in aliases.iter().take(10) {
+        lines.push(format!(
+            "  {} {} {}@L{}",
+            value_str(alias, "alias"),
+            value_str(alias, "kind"),
+            alias
+                .get("identity")
+                .map(|identity| value_str(identity, "name"))
+                .unwrap_or_default(),
+            alias
+                .get("identity")
+                .map(|identity| value_str(identity, "line"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(legend) = status
+        .get("legend")
+        .and_then(Value::as_str)
+        .filter(|legend| !legend.is_empty())
+    {
+        lines.push(legend.to_string());
+    }
+    lines.join("\n")
+}
+
+fn render_memory_lookup(result: &Value) -> String {
+    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let record = result.get("record").unwrap_or(&Value::Null);
+        let identity = record.get("identity").unwrap_or(&Value::Null);
+        return format!(
+            "{} -> {} {}@L{} {}",
+            value_str(record, "alias"),
+            value_str(record, "kind"),
+            value_str(identity, "name"),
+            value_str(identity, "line"),
+            value_str(identity, "path"),
+        );
+    }
+    format!(
+        "{}: {}",
+        value_str(result, "error"),
+        value_str(result, "message")
+    )
 }
 
 fn broker_action(action: &str) -> &str {
@@ -1047,7 +1155,10 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["lsp_log", "ticket", "journal", "ask", "chat"]);
+        assert_eq!(
+            names,
+            vec!["lsp_log", "ticket", "journal", "ask", "chat", "lsp_memory"]
+        );
     }
 
     #[test]

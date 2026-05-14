@@ -192,9 +192,12 @@ impl BrokerCore {
     }
 
     fn render_status(&self) -> Value {
+        let records = self.render.records();
         json!({
             "epoch_id": self.render.epoch_id(),
             "generation": self.render.generation(),
+            "aliases": records.iter().map(alias_record_value).collect::<Vec<_>>(),
+            "legend": self.render.aliases_for_response(&records, false),
         })
     }
 

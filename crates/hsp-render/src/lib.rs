@@ -177,6 +177,10 @@ impl RenderMemory {
         self.records_by_alias.get(alias)
     }
 
+    pub fn records(&self) -> Vec<AliasRecord> {
+        self.records_by_alias.values().cloned().collect()
+    }
+
     pub fn lookup(&self, token: &str) -> AliasResolution {
         let raw = token.trim();
         if raw.is_empty() {

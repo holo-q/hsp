@@ -1,0 +1,20 @@
+[package]
+name = "hsp-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Unix socket broker daemon runtime for HSP"
+
+[dependencies]
+hsp-broker.workspace = true
+hsp-protocol.workspace = true
+hsp-wire.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+hsp-client.workspace = true
+
+[[bin]]
+name = "hsp-broker"
+path = "src/main.rs"

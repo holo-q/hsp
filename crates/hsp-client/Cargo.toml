@@ -1,0 +1,12 @@
+[package]
+name = "hsp-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synchronous broker client for HSP"
+
+[dependencies]
+hsp-protocol.workspace = true
+hsp-wire.workspace = true
+serde_json.workspace = true

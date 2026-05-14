@@ -176,6 +176,8 @@ version = "0.1.0"
 dependencies = [
  "hsp-broker",
  "hsp-bus",
+ "hsp-client",
+ "hsp-daemon",
  "hsp-org",
  "hsp-protocol",
  "hsp-session",
@@ -200,6 +202,26 @@ version = "0.1.0"
 dependencies = [
  "hsp-wire",
  "serde",
+]
+
+[[package]]
+name = "hsp-client"
+version = "0.1.0"
+dependencies = [
+ "hsp-protocol",
+ "hsp-wire",
+ "serde_json",
+]
+
+[[package]]
+name = "hsp-daemon"
+version = "0.1.0"
+dependencies = [
+ "hsp-broker",
+ "hsp-client",
+ "hsp-protocol",
+ "hsp-wire",
+ "serde_json",
 ]
 
 [[package]]

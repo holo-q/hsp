@@ -24,6 +24,10 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `src/mcp.rs` is the stdio MCP adapter. It speaks newline-delimited JSON-RPC like the Python `FastMCP` transport and exposes the broker-backed workgroup tools (`lsp_log`, `ticket`, `journal`, `ask`, `chat`) without pulling MCP protocol concerns into the broker.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.
 
+## Display Clients
+
+- [`bob-hsp`](https://github.com/holo-q/bob-hsp) is the Bob desktop feed for Rust HSP bus weather. It reads the Rust broker through `hsp-client`, publishes `plugin.hsp` feed snapshots into `bobd`, and keeps HSP coordination visible beside Babel sessions, jobs, and orgmap without linking HSP policy into the Bob host.
+
 ## Parity Path
 
 1. Keep `hsp-wire` data-first and preserve JSON shape before adding runtime behavior.

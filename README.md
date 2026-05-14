@@ -19,6 +19,7 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 - `crates/hsp-broker` owns request dispatch and runtime orchestration. The current slice exposes bus append/recent/journal/weather/precommit/postcommit, question/reply/settle/chat routing, heartbeat/presence, and ticket/build/edit gates. It accepts an optional `WorkspaceStore`, lazily replays per-workspace JSONL logs through `hsp-store`, persists every durable bus row, and leaves heartbeat live-only.
 - `src/lib.rs` is the root facade for callers that want the integrated HSP surface.
 - `src/main.rs` / `src/cli.rs` are the CLI adapter. They keep argument parsing and broker-friendly defaults out of the core crates while exposing workgroup probes, broker lifecycle commands, `hsp log ...` bus actions, stdin hook recording, build-gated `hsp run`, `hsp watch`, and broker-global status.
+- `src/mcp.rs` is the stdio MCP adapter. It speaks newline-delimited JSON-RPC like the Python `FastMCP` transport and exposes the broker-backed workgroup tools (`lsp_log`, `ticket`, `journal`, `ask`, `chat`) without pulling MCP protocol concerns into the broker.
 - `references/hsp-py/` is the Python reference repo at the last pre-move commit.
 
 ## Parity Path
@@ -28,5 +29,6 @@ Workgroup and orgmap semantics belong to the standalone `orgmap` / `hsp-workgrou
 3. Wire `hsp-store` into broker/runtime after the in-memory bus contract is pinned; append/recent/journal shapes should not change when JSONL replay lands. The store now owns `workspace_id_for`, `bus_dir_for`, and `log_path_for`; the bus owns event/ticket rehydration; the broker owns lazy workspace replay and durable append timing.
 4. Add daemon/client socket runtime on top of `hsp-protocol`, keeping socket serving and sync client transport outside `hsp-broker` dispatch. `hsp-client` and `hsp-daemon` now cover the synchronous client, daemon socket runtime, and `hsp-broker` binary skeleton.
 5. Restore the user-facing bus surface through the Rust CLI. `hsp log <action>` now reaches broker bus methods for event/note/ask/reply/chat/ticket/journal/question/recent/settle/precommit/postcommit/weather/presence/status/build_gate/edit_gate and supplies stable CLI agent/client defaults. `hsp hook stdin <kind>` records hook payloads as bus events, `hsp run -- <command>` waits on the build gate and records `test.ran`, and `hsp watch --once` / `hsp global` provide quick broker visibility while the richer Python watch formatting is still being ported.
-6. Port LSP routing/session management as a runtime crate, not as DTO residue.
-7. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.
+6. Restore the MCP workgroup surface before the LSP wave so agents can use the Rust broker directly. `hsp mcp` now handles `initialize`, `tools/list`, and `tools/call` for the Python-compatible broker tools with compact text renderers and broker autostart.
+7. Port LSP routing/session management as a runtime crate, not as DTO residue.
+8. Preserve every behavior listed in the Python reference ledger or delete it by explicit design note.

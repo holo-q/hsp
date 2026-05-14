@@ -20,6 +20,7 @@ pub fn run() -> CliResult {
         "global" => global_command(),
         "hook" => hook_command(&args[1..]),
         "log" => log_command(&args[1..]),
+        "mcp" => crate::mcp::run(),
         "run" => run_command(&args[1..]),
         "watch" => watch_command(&args[1..]),
         "ping" => request_and_print("ping", Map::new(), true),
@@ -816,6 +817,7 @@ fn print_help() {
     println!("  hsp [path]");
     println!("  hsp workgroup [path]");
     println!("  hsp broker");
+    println!("  hsp mcp");
     println!("  hsp socket");
     println!("  hsp ping|status|shutdown");
     println!("  hsp hook stdin <kind> [options]");

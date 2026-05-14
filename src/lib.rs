@@ -15,6 +15,12 @@ pub use hsp_lsp::{
     parse_replace, read_lsp_message,
 };
 pub use hsp_org::HspWorkspace;
+pub use hsp_render::{
+    AliasError, AliasIdentity, AliasKind, AliasRecord, AliasResolution, LegendBucket,
+    LegendMember, RenderMemory, RenderMemorySnapshot, compact_one_line, format_alias_chip,
+    format_compact_row, format_empty_state, format_legend_block, format_path_dense,
+    format_path_dense_header, format_sample_lines, format_sample_locs, format_truncation_footer,
+};
 pub use hsp_protocol::{
     BROKER_MODE_ENV, DEFAULT_IDLE_TTL_SECONDS, DEFAULT_SOCKET_NAME, IDLE_TTL_ENV,
     LOG_ENV_OVERRIDE, ProtocolEnv, SOCKET_ENV_OVERRIDE, broker_log_path,

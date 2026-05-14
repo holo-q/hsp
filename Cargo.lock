@@ -181,6 +181,7 @@ dependencies = [
  "hsp-lsp",
  "hsp-org",
  "hsp-protocol",
+ "hsp-render",
  "hsp-session",
  "hsp-store",
  "hsp-wire",
@@ -243,6 +244,10 @@ dependencies = [
 
 [[package]]
 name = "hsp-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "hsp-render"
 version = "0.1.0"
 
 [[package]]

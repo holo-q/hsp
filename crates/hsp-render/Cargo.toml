@@ -1,0 +1,9 @@
+[package]
+name = "hsp-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Render memory and compact formatting for HSP"
+
+[dependencies]

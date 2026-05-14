@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ pub fn run() -> CliResult {
     match command {
         "broker" => hsp::serve_default().map_err(Into::into),
         "global" => global_command(),
+        "hook" => hook_command(&args[1..]),
         "log" => log_command(&args[1..]),
         "run" => run_command(&args[1..]),
         "watch" => watch_command(&args[1..]),
@@ -54,6 +56,127 @@ fn log_command(args: &[OsString]) -> CliResult {
     let options = LogOptions::parse(action, &args[1..])?;
     let method = options.method()?;
     request_and_print(&method, options.params()?, true)
+}
+
+fn hook_command(args: &[OsString]) -> CliResult {
+    if args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| matches!(arg, "-h" | "--help" | "help"))
+    {
+        print_hook_help();
+        return Ok(());
+    }
+    let mut options = HookOptions::parse(args)?;
+    let mut payload = String::new();
+    std::io::stdin().read_to_string(&mut payload)?;
+    if options.message.is_empty() {
+        options.message = hook_message(&payload);
+    }
+
+    let mut params = Map::new();
+    params.insert("workspace_root".to_string(), json!(options.workspace_root));
+    params.insert("agent_id".to_string(), json!(options.agent_id));
+    params.insert("client_id".to_string(), json!(options.client_id));
+    params.insert("now".to_string(), json!(now_seconds()));
+    params.insert("message".to_string(), json!(options.message));
+    insert_string(&mut params, "files", &options.files);
+    insert_string(&mut params, "symbols", &options.symbols);
+    insert_string(&mut params, "aliases", &options.aliases);
+    params.insert("event_type".to_string(), json!(options.kind));
+    params.insert("kind".to_string(), json!(options.kind));
+    let mut metadata = BTreeMap::new();
+    insert_metadata(&mut metadata, "status", &options.status);
+    insert_metadata(&mut metadata, "targets", &options.targets);
+    insert_metadata(&mut metadata, "commit", &options.commit);
+    if !payload.trim().is_empty() {
+        insert_metadata(&mut metadata, "hook_payload", payload.trim());
+    }
+    if !metadata.is_empty() {
+        params.insert("metadata".to_string(), serde_json::to_value(metadata)?);
+    }
+    request_and_print("bus.event", params, true)
+}
+
+#[derive(Debug, Clone)]
+struct HookOptions {
+    kind: String,
+    message: String,
+    files: String,
+    symbols: String,
+    aliases: String,
+    status: String,
+    targets: String,
+    commit: String,
+    workspace_root: String,
+    agent_id: String,
+    client_id: String,
+}
+
+impl HookOptions {
+    fn parse(args: &[OsString]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut options = Self {
+            kind: String::new(),
+            message: String::new(),
+            files: String::new(),
+            symbols: String::new(),
+            aliases: String::new(),
+            status: String::new(),
+            targets: String::new(),
+            commit: String::new(),
+            workspace_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+            agent_id: default_agent_id(),
+            client_id: default_client_id(),
+        };
+
+        let mut index = 0;
+        if args.first().and_then(|arg| arg.to_str()) == Some("stdin") {
+            index = 1;
+            options.kind = args
+                .get(index)
+                .ok_or("hsp hook stdin requires a kind")?
+                .to_string_lossy()
+                .into_owned();
+            index += 1;
+        }
+
+        while index < args.len() {
+            let flag = args[index].to_string_lossy();
+            let value = match flag.as_ref() {
+                "--kind" | "--message" | "--files" | "--symbols" | "--aliases" | "--status"
+                | "--targets" | "--commit" | "--workspace-root" | "--root" | "--agent-id"
+                | "--client-id" => {
+                    index += 1;
+                    args.get(index)
+                        .ok_or_else(|| format!("{flag} requires a value"))?
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                other => return err(format!("unknown hsp hook option: {other}")),
+            };
+
+            match flag.as_ref() {
+                "--kind" => options.kind = value,
+                "--message" => options.message = value,
+                "--files" => options.files = value,
+                "--symbols" => options.symbols = value,
+                "--aliases" => options.aliases = value,
+                "--status" => options.status = value,
+                "--targets" => options.targets = value,
+                "--commit" => options.commit = value,
+                "--workspace-root" | "--root" => options.workspace_root = normalize_root(value),
+                "--agent-id" => options.agent_id = value,
+                "--client-id" => options.client_id = value,
+                _ => {}
+            }
+            index += 1;
+        }
+
+        if options.kind.is_empty() {
+            return err("hsp hook requires `stdin <kind>` or --kind <kind>");
+        }
+        Ok(options)
+    }
 }
 
 fn global_command() -> CliResult {
@@ -616,6 +739,25 @@ fn compact_event(event: &Value) -> String {
     }
 }
 
+fn hook_message(payload: &str) -> String {
+    let raw = payload.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        for key in ["message", "prompt", "command", "tool_name"] {
+            if let Some(text) = value
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                return text.to_string();
+            }
+        }
+    }
+    raw.lines().next().unwrap_or("").chars().take(500).collect()
+}
+
 fn default_agent_id() -> String {
     std::env::var("HSP_AGENT_ID")
         .or_else(|_| std::env::var("CODEX_AGENT_ID"))
@@ -676,6 +818,7 @@ fn print_help() {
     println!("  hsp broker");
     println!("  hsp socket");
     println!("  hsp ping|status|shutdown");
+    println!("  hsp hook stdin <kind> [options]");
     println!("  hsp log <action> [options]");
     println!("  hsp run [options] -- <command>");
     println!("  hsp watch [path...] [--once] [--global]");
@@ -713,4 +856,20 @@ fn print_run_help() {
     println!("  --workspace-root <path>");
     println!("  --agent-id <id>");
     println!("  --no-log");
+}
+
+fn print_hook_help() {
+    println!("hsp hook stdin <kind> [options]");
+    println!("options:");
+    println!("  --kind <event-kind>");
+    println!("  --message <text>");
+    println!("  --files <scope>");
+    println!("  --symbols <scope>");
+    println!("  --aliases <scope>");
+    println!("  --status <status>");
+    println!("  --targets <targets>");
+    println!("  --commit <sha>");
+    println!("  --workspace-root <path>");
+    println!("  --agent-id <id>");
+    println!("  --client-id <id>");
 }

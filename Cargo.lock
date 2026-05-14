@@ -183,6 +183,7 @@ dependencies = [
  "hsp-session",
  "hsp-store",
  "hsp-wire",
+ "serde_json",
 ]
 
 [[package]]

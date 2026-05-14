@@ -5,6 +5,7 @@ members = [
     "crates/hsp-bus",
     "crates/hsp-client",
     "crates/hsp-daemon",
+    "crates/hsp-lsp",
     "crates/hsp-org",
     "crates/hsp-protocol",
     "crates/hsp-session",
@@ -24,6 +25,7 @@ hsp-broker = { path = "crates/hsp-broker" }
 hsp-bus = { path = "crates/hsp-bus" }
 hsp-client = { path = "crates/hsp-client" }
 hsp-daemon = { path = "crates/hsp-daemon" }
+hsp-lsp = { path = "crates/hsp-lsp" }
 hsp-org = { path = "crates/hsp-org" }
 hsp-protocol = { path = "crates/hsp-protocol" }
 hsp-session = { path = "crates/hsp-session" }
@@ -47,6 +49,7 @@ hsp-broker.workspace = true
 hsp-bus.workspace = true
 hsp-client.workspace = true
 hsp-daemon.workspace = true
+hsp-lsp.workspace = true
 hsp-org.workspace = true
 hsp-protocol.workspace = true
 hsp-session.workspace = true

@@ -8,6 +8,10 @@ pub use hsp_bus::{
 };
 pub use hsp_client::{BrokerClient, start_broker_subprocess};
 pub use hsp_daemon::{ServeOptions, serve_default, serve_unix};
+pub use hsp_lsp::{
+    ChainParseError, ChainServer, file_uri, language_id_for_path, language_id_for_uri, parse_chain,
+    parse_chain_from_env, parse_prefer, parse_prefer_from_env, parse_replace,
+};
 pub use hsp_org::HspWorkspace;
 pub use hsp_protocol::{
     BROKER_MODE_ENV, DEFAULT_IDLE_TTL_SECONDS, DEFAULT_SOCKET_NAME, IDLE_TTL_ENV,

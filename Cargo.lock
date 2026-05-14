@@ -178,6 +178,7 @@ dependencies = [
  "hsp-bus",
  "hsp-client",
  "hsp-daemon",
+ "hsp-lsp",
  "hsp-org",
  "hsp-protocol",
  "hsp-session",
@@ -225,6 +226,10 @@ dependencies = [
  "hsp-wire",
  "serde_json",
 ]
+
+[[package]]
+name = "hsp-lsp"
+version = "0.1.0"
 
 [[package]]
 name = "hsp-org"

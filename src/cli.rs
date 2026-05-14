@@ -18,6 +18,7 @@ pub fn run() -> CliResult {
         "broker" => hsp::serve_default().map_err(Into::into),
         "global" => global_command(),
         "log" => log_command(&args[1..]),
+        "run" => run_command(&args[1..]),
         "watch" => watch_command(&args[1..]),
         "ping" => request_and_print("ping", Map::new(), true),
         "status" => request_and_print("status", Map::new(), true),
@@ -58,6 +59,205 @@ fn log_command(args: &[OsString]) -> CliResult {
 fn global_command() -> CliResult {
     let status = request("status", Map::new(), true)?;
     println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
+
+fn run_command(args: &[OsString]) -> CliResult {
+    if args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| matches!(arg, "-h" | "--help" | "help"))
+    {
+        print_run_help();
+        return Ok(());
+    }
+    let options = RunOptions::parse(args)?;
+    let gate = wait_for_build_gate(&options)?;
+    if !gate
+        .get("unlocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return err(format!(
+            "build gate locked: {}",
+            gate.get("reason").and_then(Value::as_str).unwrap_or("unknown")
+        ));
+    }
+
+    let status = std::process::Command::new(&options.argv[0])
+        .args(&options.argv[1..])
+        .status()?;
+    if !options.no_log {
+        log_run_result(&options, status.success())?;
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[derive(Debug, Clone)]
+struct RunOptions {
+    argv: Vec<OsString>,
+    timeout_seconds: f64,
+    kind: String,
+    files: String,
+    symbols: String,
+    message: String,
+    no_log: bool,
+    workspace_root: String,
+    agent_id: String,
+}
+
+impl RunOptions {
+    fn parse(args: &[OsString]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut options = Self {
+            argv: Vec::new(),
+            timeout_seconds: 120.0,
+            kind: "test.ran".to_string(),
+            files: String::new(),
+            symbols: String::new(),
+            message: String::new(),
+            no_log: false,
+            workspace_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+            agent_id: default_agent_id(),
+        };
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].to_string_lossy();
+            if arg == "--" {
+                options.argv = args[index + 1..].to_vec();
+                break;
+            }
+            match arg.as_ref() {
+                "-h" | "--help" | "help" => return err("hsp run help must be the first argument"),
+                "--timeout" => {
+                    index += 1;
+                    options.timeout_seconds = parse_duration_seconds(
+                        &args
+                            .get(index)
+                            .ok_or("--timeout requires a value")?
+                            .to_string_lossy(),
+                    )?;
+                }
+                "--kind" => {
+                    index += 1;
+                    options.kind = args
+                        .get(index)
+                        .ok_or("--kind requires a value")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--files" => {
+                    index += 1;
+                    options.files = args
+                        .get(index)
+                        .ok_or("--files requires a value")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--symbols" => {
+                    index += 1;
+                    options.symbols = args
+                        .get(index)
+                        .ok_or("--symbols requires a value")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--message" => {
+                    index += 1;
+                    options.message = args
+                        .get(index)
+                        .ok_or("--message requires a value")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--workspace-root" | "--root" => {
+                    index += 1;
+                    options.workspace_root = normalize_root(
+                        args.get(index)
+                            .ok_or("--workspace-root requires a value")?
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                "--agent-id" => {
+                    index += 1;
+                    options.agent_id = args
+                        .get(index)
+                        .ok_or("--agent-id requires a value")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--no-log" => options.no_log = true,
+                value if value.starts_with('-') => {
+                    return err(format!("unknown hsp run option: {value}"));
+                }
+                _ => {
+                    options.argv = args[index..].to_vec();
+                    break;
+                }
+            }
+            index += 1;
+        }
+
+        if options.argv.is_empty() {
+            return err("hsp run requires a command after --");
+        }
+        Ok(options)
+    }
+}
+
+fn wait_for_build_gate(options: &RunOptions) -> Result<Value, Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    loop {
+        let mut params = Map::new();
+        params.insert("workspace_root".to_string(), json!(options.workspace_root));
+        params.insert("agent_id".to_string(), json!(options.agent_id));
+        params.insert("now".to_string(), json!(now_seconds()));
+        params.insert("files".to_string(), json!(options.files));
+        params.insert("symbols".to_string(), json!(options.symbols));
+        params.insert("full_workspace".to_string(), json!(options.files.is_empty()));
+        let gate = request("bus.build_gate", params, true)?;
+        if gate
+            .get("unlocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || started.elapsed().as_secs_f64() >= options.timeout_seconds
+        {
+            return Ok(gate);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn log_run_result(options: &RunOptions, passed: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let message = if options.message.is_empty() {
+        options
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        options.message.clone()
+    };
+    let mut params = Map::new();
+    params.insert("workspace_root".to_string(), json!(options.workspace_root));
+    params.insert("agent_id".to_string(), json!(options.agent_id));
+    params.insert("client_id".to_string(), json!(default_client_id()));
+    params.insert("now".to_string(), json!(now_seconds()));
+    params.insert("message".to_string(), json!(message));
+    params.insert("files".to_string(), json!(options.files));
+    params.insert("symbols".to_string(), json!(options.symbols));
+    params.insert("event_type".to_string(), json!(options.kind));
+    params.insert("kind".to_string(), json!(options.kind));
+    params.insert(
+        "metadata".to_string(),
+        json!({
+            "status": if passed { "passed" } else { "failed" },
+            "targets": options.argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" "),
+        }),
+    );
+    request("bus.event", params, true)?;
     Ok(())
 }
 
@@ -433,6 +633,25 @@ fn now_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn parse_duration_seconds(raw: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(0.0);
+    }
+    let (number, scale) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3600.0)
+    } else {
+        (value.as_str(), 1.0)
+    };
+    Ok((number.parse::<f64>()? * scale).max(0.0))
+}
+
 fn normalize_root(raw: String) -> String {
     let path = PathBuf::from(raw);
     let path = if path.is_absolute() {
@@ -458,6 +677,7 @@ fn print_help() {
     println!("  hsp socket");
     println!("  hsp ping|status|shutdown");
     println!("  hsp log <action> [options]");
+    println!("  hsp run [options] -- <command>");
     println!("  hsp watch [path...] [--once] [--global]");
     println!("  hsp global");
 }
@@ -480,4 +700,17 @@ fn print_watch_help() {
     println!("  --global");
     println!("  --limit <n>");
     println!("  --interval <seconds>");
+}
+
+fn print_run_help() {
+    println!("hsp run [options] -- <command>");
+    println!("options:");
+    println!("  --timeout <duration>");
+    println!("  --kind <event-kind>");
+    println!("  --files <scope>");
+    println!("  --symbols <scope>");
+    println!("  --message <text>");
+    println!("  --workspace-root <path>");
+    println!("  --agent-id <id>");
+    println!("  --no-log");
 }

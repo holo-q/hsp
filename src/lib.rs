@@ -9,9 +9,9 @@ pub use hsp_bus::{
 pub use hsp_client::{BrokerClient, start_broker_subprocess};
 pub use hsp_daemon::{ServeOptions, serve_default, serve_unix};
 pub use hsp_lsp::{
-    ChainParseError, ChainServer, LspFrameError, encode_lsp_message, file_uri,
-    language_id_for_path, language_id_for_uri, parse_chain, parse_chain_from_env, parse_prefer,
-    parse_prefer_from_env, parse_replace, read_lsp_message,
+    ChainParseError, ChainServer, LspClient, LspClientError, LspFrameError, encode_lsp_message,
+    file_uri, initialize_params, language_id_for_path, language_id_for_uri, parse_chain,
+    parse_chain_from_env, parse_prefer, parse_prefer_from_env, parse_replace, read_lsp_message,
 };
 pub use hsp_org::HspWorkspace;
 pub use hsp_protocol::{

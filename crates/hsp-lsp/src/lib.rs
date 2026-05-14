@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::io::BufRead;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainServer {
@@ -284,6 +285,245 @@ pub fn read_lsp_message(reader: &mut impl BufRead) -> Result<Option<Value>, LspF
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
+#[derive(Debug)]
+pub enum LspClientError {
+    Io(std::io::Error),
+    Frame(LspFrameError),
+    Json(serde_json::Error),
+    Protocol(String),
+    Server { code: i64, message: String, data: Option<Value> },
+}
+
+impl Display for LspClientError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "LSP I/O error: {error}"),
+            Self::Frame(error) => Display::fmt(error, formatter),
+            Self::Json(error) => write!(formatter, "LSP JSON error: {error}"),
+            Self::Protocol(message) => formatter.write_str(message),
+            Self::Server {
+                code,
+                message,
+                data,
+            } => {
+                write!(formatter, "LSP error {code}: {message}")?;
+                if let Some(data) = data {
+                    write!(formatter, "\nData: {data}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Error for LspClientError {}
+
+impl From<std::io::Error> for LspClientError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<LspFrameError> for LspClientError {
+    fn from(error: LspFrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<serde_json::Error> for LspClientError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Debug)]
+pub struct LspClient {
+    command: ChainServer,
+    root_path: PathBuf,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+    capabilities: Value,
+}
+
+impl LspClient {
+    pub fn start(command: ChainServer, root_path: impl AsRef<Path>) -> Result<Self, LspClientError> {
+        let root_path = std::path::absolute(root_path)?;
+        let mut child = Command::new(&command.command)
+            .args(&command.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    LspClientError::Protocol(format!("missing LSP binary: {}", command.command))
+                } else {
+                    LspClientError::Io(error)
+                }
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LspClientError::Protocol("LSP child stdin was not piped".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LspClientError::Protocol("LSP child stdout was not piped".to_string()))?;
+
+        let mut client = Self {
+            command,
+            root_path,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            capabilities: Value::Null,
+        };
+        let initialized = client.request("initialize", initialize_params(&client.root_path)?)?;
+        client.capabilities = initialized
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        client.notify("initialized", json!({}))?;
+        Ok(client)
+    }
+
+    pub fn command(&self) -> &ChainServer {
+        &self.command
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    pub fn capabilities(&self) -> &Value {
+        &self.capabilities
+    }
+
+    pub fn request(&mut self, method: &str, params: Value) -> Result<Value, LspClientError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+
+        loop {
+            let Some(message) = read_lsp_message(&mut self.stdout)? else {
+                return Err(LspClientError::Protocol(format!(
+                    "LSP server exited before response to {method}"
+                )));
+            };
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error").and_then(Value::as_object) {
+                return Err(server_error(error));
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    pub fn notify(&mut self, method: &str, params: Value) -> Result<(), LspClientError> {
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    pub fn stop(mut self) -> Result<(), LspClientError> {
+        let _ = self.request("shutdown", Value::Null);
+        let _ = self.notify("exit", Value::Null);
+        let _ = self.child.wait();
+        Ok(())
+    }
+
+    fn write_message(&mut self, message: &Value) -> Result<(), LspClientError> {
+        let frame = encode_lsp_message(message)?;
+        self.stdin.write_all(&frame)?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn initialize_params(root_path: &Path) -> Result<Value, std::io::Error> {
+    let root_path = std::path::absolute(root_path)?;
+    let root_uri = file_uri(&root_path)?;
+    let root_name = root_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    Ok(json!({
+        "processId": std::process::id(),
+        "rootUri": root_uri,
+        "rootPath": root_path.to_string_lossy(),
+        "capabilities": {
+            "textDocument": {
+                "diagnostic": {},
+                "codeAction": {},
+                "rename": {"prepareSupport": true},
+                "signatureHelp": {},
+                "completion": {
+                    "completionItem": {"snippetSupport": false},
+                },
+                "formatting": {},
+                "typeDefinition": {},
+                "documentSymbol": {},
+                "publishDiagnostics": {"relatedInformation": true},
+                "callHierarchy": {},
+                "typeHierarchy": {},
+            },
+            "workspace": {
+                "workspaceFolders": true,
+                "configuration": true,
+                "fileOperations": {
+                    "dynamicRegistration": false,
+                    "willRename": true,
+                    "didRename": true,
+                    "willCreate": true,
+                    "didCreate": true,
+                    "willDelete": true,
+                    "didDelete": true,
+                },
+                "workspaceEdit": {
+                    "documentChanges": true,
+                    "resourceOperations": ["create", "rename", "delete"],
+                    "failureHandling": "textOnlyTransactional",
+                    "normalizesLineEndings": true,
+                    "changeAnnotationSupport": {"groupsOnLabel": true},
+                },
+            },
+        },
+        "workspaceFolders": [
+            {"uri": root_uri, "name": root_name},
+        ],
+    }))
+}
+
+fn server_error(error: &Map<String, Value>) -> LspClientError {
+    LspClientError::Server {
+        code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown LSP error")
+            .to_string(),
+        data: error.get("data").cloned(),
+    }
+}
+
 fn split_args(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(str::to_string).collect()
 }
@@ -423,5 +663,38 @@ mod tests {
             read_lsp_message(&mut reader),
             Err(LspFrameError::MissingContentLength)
         ));
+    }
+
+    #[test]
+    fn initialize_params_match_reference_capability_shape() {
+        let params = initialize_params(Path::new(".")).unwrap();
+
+        assert_eq!(params["capabilities"]["workspace"]["workspaceFolders"], json!(true));
+        assert_eq!(
+            params["capabilities"]["workspace"]["workspaceEdit"]["resourceOperations"],
+            json!(["create", "rename", "delete"])
+        );
+        assert_eq!(
+            params["capabilities"]["textDocument"]["rename"]["prepareSupport"],
+            json!(true)
+        );
+        assert!(params["rootUri"].as_str().unwrap().starts_with("file://"));
+    }
+
+    #[test]
+    #[ignore = "requires rust-analyzer on PATH and starts a real language server"]
+    fn rust_analyzer_smoke_initializes_and_shuts_down() {
+        if std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let client = LspClient::start(ChainServer::new("rust-analyzer", Vec::new(), "rust-analyzer"), ".");
+        let client = client.unwrap();
+        assert!(client.capabilities().is_object());
+        client.stop().unwrap();
     }
 }

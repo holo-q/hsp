@@ -347,6 +347,36 @@ pub struct LspClient {
     capabilities: Value,
 }
 
+#[derive(Debug)]
+pub struct LspRuntime {
+    root_path: PathBuf,
+    chain: Vec<ChainServer>,
+    prefer: BTreeMap<String, usize>,
+    method_handler: BTreeMap<String, usize>,
+    clients: Vec<Option<LspClient>>,
+    request_count: u64,
+    last_method: String,
+    last_server_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LspRequestResult {
+    pub result: Value,
+    pub server_label: String,
+    pub started: Vec<String>,
+}
+
+impl LspRequestResult {
+    pub fn to_wire(&self) -> Value {
+        json!({
+            "result": self.result,
+            "server_label": self.server_label,
+            "started": self.started,
+            "workspaces_added": [],
+        })
+    }
+}
+
 impl LspClient {
     pub fn start(command: ChainServer, root_path: impl AsRef<Path>) -> Result<Self, LspClientError> {
         let root_path = std::path::absolute(root_path)?;
@@ -451,6 +481,146 @@ impl LspClient {
     }
 }
 
+impl LspRuntime {
+    pub fn from_env(root_path: impl AsRef<Path>) -> Result<Self, ChainParseError> {
+        let chain = parse_chain_from_env()?;
+        let prefer = parse_prefer_from_env(&chain);
+        Ok(Self::new(root_path, chain, prefer))
+    }
+
+    pub fn new(
+        root_path: impl AsRef<Path>,
+        chain: Vec<ChainServer>,
+        prefer: BTreeMap<String, usize>,
+    ) -> Self {
+        let root_path =
+            std::path::absolute(root_path).unwrap_or_else(|_| PathBuf::from("."));
+        let clients = (0..chain.len()).map(|_| None).collect();
+        Self {
+            root_path,
+            chain,
+            method_handler: prefer.clone(),
+            prefer,
+            clients,
+            request_count: 0,
+            last_method: String::new(),
+            last_server_label: String::new(),
+        }
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    pub fn chain(&self) -> &[ChainServer] {
+        &self.chain
+    }
+
+    pub fn status(&self) -> Value {
+        json!({
+            "root": self.root_path,
+            "chain": self.chain.iter().map(chain_server_to_wire).collect::<Vec<_>>(),
+            "clients": self.clients.iter().enumerate().map(|(index, client)| {
+                json!({
+                    "index": index,
+                    "server_label": self.chain[index].label,
+                    "started": client.is_some(),
+                })
+            }).collect::<Vec<_>>(),
+            "prefer": self.prefer,
+            "method_handler": self.method_handler,
+            "request_count": self.request_count,
+            "last_method": self.last_method,
+            "last_server_label": self.last_server_label,
+        })
+    }
+
+    pub fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        empty_fallback_methods: &[String],
+    ) -> Result<LspRequestResult, LspClientError> {
+        if self.chain.is_empty() {
+            return Err(LspClientError::Protocol(
+                "LSP chain is empty; set LSP_SERVERS or LSP_COMMAND".to_string(),
+            ));
+        }
+
+        let mut order = Vec::new();
+        if let Some(index) = self
+            .method_handler
+            .get(method)
+            .or_else(|| self.prefer.get(method))
+            .copied()
+            .filter(|index| *index < self.chain.len())
+        {
+            order.push(index);
+        }
+        for index in 0..self.chain.len() {
+            if !order.contains(&index) {
+                order.push(index);
+            }
+        }
+
+        let mut last_error = None;
+        let mut started = Vec::new();
+        let allow_empty_fallback = empty_fallback_methods.iter().any(|item| item == method);
+        for index in order {
+            if self.clients[index].is_none() {
+                let client = LspClient::start(self.chain[index].clone(), &self.root_path)?;
+                self.clients[index] = Some(client);
+                started.push(self.chain[index].label.clone());
+            }
+            let client = self.clients[index]
+                .as_mut()
+                .expect("client was just initialized");
+            match client.request(method, params.clone()) {
+                Ok(result) if allow_empty_fallback && is_empty_lsp_result(&result) => {
+                    last_error = Some(LspClientError::Protocol(format!(
+                        "{} returned an empty result for {method}",
+                        self.chain[index].label
+                    )));
+                    continue;
+                }
+                Ok(result) => {
+                    self.method_handler.insert(method.to_string(), index);
+                    self.request_count += 1;
+                    self.last_method = method.to_string();
+                    self.last_server_label = self.chain[index].label.clone();
+                    return Ok(LspRequestResult {
+                        result,
+                        server_label: self.chain[index].label.clone(),
+                        started,
+                    });
+                }
+                Err(error) => {
+                    self.clients[index] = None;
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            LspClientError::Protocol(format!("no LSP server handled {method}"))
+        }))
+    }
+
+    pub fn stop(&mut self) {
+        for client in &mut self.clients {
+            if let Some(client) = client.take() {
+                let _ = client.stop();
+            }
+        }
+    }
+}
+
+impl Drop for LspRuntime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -521,6 +691,25 @@ fn server_error(error: &Map<String, Value>) -> LspClientError {
             .unwrap_or("unknown LSP error")
             .to_string(),
         data: error.get("data").cloned(),
+    }
+}
+
+fn chain_server_to_wire(server: &ChainServer) -> Value {
+    json!({
+        "command": server.command,
+        "args": server.args,
+        "name": server.name,
+        "label": server.label,
+    })
+}
+
+fn is_empty_lsp_result(result: &Value) -> bool {
+    match result {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Object(items) => items.is_empty(),
+        Value::String(text) => text.is_empty(),
+        _ => false,
     }
 }
 
@@ -679,6 +868,20 @@ mod tests {
             json!(true)
         );
         assert!(params["rootUri"].as_str().unwrap().starts_with("file://"));
+    }
+
+    #[test]
+    fn runtime_status_reports_chain_without_starting_clients() {
+        let runtime = LspRuntime::new(
+            ".",
+            vec![ChainServer::new("rust-analyzer", Vec::new(), "rust-analyzer")],
+            BTreeMap::from([("textDocument/definition".to_string(), 0)]),
+        );
+        let status = runtime.status();
+
+        assert_eq!(status["chain"][0]["command"], json!("rust-analyzer"));
+        assert_eq!(status["clients"][0]["started"], json!(false));
+        assert_eq!(status["method_handler"]["textDocument/definition"], json!(0));
     }
 
     #[test]

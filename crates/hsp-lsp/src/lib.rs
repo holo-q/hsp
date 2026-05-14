@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::io::BufRead;
 use std::path::Path;
+
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainServer {
@@ -201,6 +204,86 @@ pub fn language_id_for_uri(uri: &str) -> &'static str {
     language_id_for_path(path)
 }
 
+#[derive(Debug)]
+pub enum LspFrameError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    InvalidHeader(String),
+    MissingContentLength,
+}
+
+impl Display for LspFrameError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "LSP frame I/O error: {error}"),
+            Self::Json(error) => write!(formatter, "LSP frame JSON error: {error}"),
+            Self::InvalidHeader(header) => write!(formatter, "invalid LSP header: {header}"),
+            Self::MissingContentLength => formatter.write_str("LSP frame missing Content-Length"),
+        }
+    }
+}
+
+impl Error for LspFrameError {}
+
+impl From<std::io::Error> for LspFrameError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for LspFrameError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+pub fn encode_lsp_message(message: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    let body = serde_json::to_vec(message)?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    let mut frame = Vec::with_capacity(header.len() + body.len());
+    frame.extend_from_slice(header.as_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+pub fn read_lsp_message(reader: &mut impl BufRead) -> Result<Option<Value>, LspFrameError> {
+    let mut content_length = None;
+    let mut saw_header = false;
+
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return if saw_header {
+                Err(LspFrameError::MissingContentLength)
+            } else {
+                Ok(None)
+            };
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        saw_header = true;
+        let Some((name, value)) = trimmed.split_once(':') else {
+            return Err(LspFrameError::InvalidHeader(trimmed.to_string()));
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim().parse::<usize>().map_err(|_| {
+                LspFrameError::InvalidHeader(format!("Content-Length: {}", value.trim()))
+            })?;
+            content_length = Some(value);
+        }
+    }
+
+    let Some(content_length) = content_length else {
+        return Err(LspFrameError::MissingContentLength);
+    };
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body)?;
+    Ok(Some(serde_json::from_slice(&body)?))
+}
+
 fn split_args(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(str::to_string).collect()
 }
@@ -221,6 +304,8 @@ fn percent_encode_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::BufReader;
 
     fn env<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
         |name| {
@@ -307,5 +392,36 @@ mod tests {
 
         assert!(uri.starts_with("file:///"));
         assert!(uri.ends_with("a%20path.rs"));
+    }
+
+    #[test]
+    fn lsp_frame_round_trips_jsonrpc_messages() {
+        let message = json!({"jsonrpc": "2.0", "id": 7, "method": "initialize"});
+        let frame = encode_lsp_message(&message).unwrap();
+        let mut reader = BufReader::new(frame.as_slice());
+
+        assert_eq!(read_lsp_message(&mut reader).unwrap(), Some(message));
+        assert_eq!(read_lsp_message(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn lsp_frame_accepts_extra_headers_and_lf() {
+        let frame = b"Content-Type: application/vscode-jsonrpc; charset=utf-8\nContent-Length: 15\n\n{\"jsonrpc\":\"2\"}";
+        let mut reader = BufReader::new(frame.as_slice());
+
+        assert_eq!(
+            read_lsp_message(&mut reader).unwrap(),
+            Some(json!({"jsonrpc": "2"}))
+        );
+    }
+
+    #[test]
+    fn lsp_frame_requires_content_length() {
+        let mut reader = BufReader::new(b"Content-Type: test\r\n\r\n{}".as_slice());
+
+        assert!(matches!(
+            read_lsp_message(&mut reader),
+            Err(LspFrameError::MissingContentLength)
+        ));
     }
 }

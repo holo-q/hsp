@@ -7,3 +7,4 @@ license.workspace = true
 description = "LSP routing and runtime primitives for HSP"
 
 [dependencies]
+serde_json.workspace = true

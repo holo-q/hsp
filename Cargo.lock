@@ -230,6 +230,9 @@ dependencies = [
 [[package]]
 name = "hsp-lsp"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "hsp-org"

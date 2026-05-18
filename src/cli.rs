@@ -87,6 +87,13 @@ fn hook_command(args: &[OsString]) -> CliResult {
     if options.message.is_empty() {
         options.message = hook_message(&payload);
     }
+    if matches!(options.kind.as_str(), "prompt" | "user.prompt") && options.message.trim() == ".end"
+    {
+        options.kind = "session.stop".to_string();
+        options.message = ".end".to_string();
+    }
+    let original_hook_kind = options.kind.clone();
+    options.kind = normalize_hook_kind(&options.kind);
     let command = hook_command_value(&payload_value);
     options.files = join_scope(&options.files, hook_files(&payload_value));
     options.symbols = join_scope(&options.symbols, hook_symbols(&payload_value));
@@ -177,6 +184,9 @@ fn hook_command(args: &[OsString]) -> CliResult {
     insert_metadata(&mut metadata, "status", &options.status);
     insert_metadata(&mut metadata, "targets", &options.targets);
     insert_metadata(&mut metadata, "commit", &options.commit);
+    if original_hook_kind != options.kind {
+        insert_metadata(&mut metadata, "hook_kind", &original_hook_kind);
+    }
     if let Some(spec) = &build_after_spec {
         insert_metadata(&mut metadata, "tool", &spec.tool);
         insert_metadata(&mut metadata, "phase", spec.phase.as_str());
@@ -1172,8 +1182,19 @@ fn is_context_hook(kind: &str, payload: &Value) -> bool {
                 "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
             );
     }
-    matches!(kind, "tool.before" | "tool.after")
+    matches!(kind, "tool.before" | "tool.after" | "pre_tool" | "post_tool")
         && matches!(tool.as_str(), "Read" | "NotebookRead")
+}
+
+fn normalize_hook_kind(kind: &str) -> String {
+    match kind {
+        "session.end" => "session.stop".to_string(),
+        "compact.after" | "permission.request" | "stop.failure" | "subagent.start" => {
+            "babel.event".to_string()
+        }
+        value if hsp_wire::BusEventKind::from_wire(value).is_ok() => value.to_string(),
+        _ => "babel.event".to_string(),
+    }
 }
 
 fn hook_context_target(files: &str, symbols: &str) -> String {

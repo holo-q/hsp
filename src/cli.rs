@@ -88,6 +88,15 @@ fn hook_command(args: &[OsString]) -> CliResult {
         options.message = hook_message(&payload);
     }
     let command = hook_command_value(&payload_value);
+    options.files = join_scope(&options.files, hook_files(&payload_value));
+    options.symbols = join_scope(&options.symbols, hook_symbols(&payload_value));
+    if is_edit_before_hook(&options.kind) && require_ticket_for_edits() {
+        let gate = edit_gate(&options.workspace_root, &options.agent_id)?;
+        if !gate.get("allowed").and_then(Value::as_bool).unwrap_or(false) {
+            write_hook_denial(&edit_denial_reason(&gate))?;
+            return Ok(());
+        }
+    }
     if is_build_before_hook(&options.kind, &payload_value, &command) {
         let Some(spec) = command_gate_spec_from_line(&command) else {
             return Ok(());
@@ -949,10 +958,24 @@ fn authoritative_build_enabled() -> bool {
     !is_false_env_value(&value)
 }
 
+fn require_ticket_for_edits() -> bool {
+    let Ok(value) = std::env::var("HSP_REQUIRE_TICKET_FOR_EDITS") else {
+        return false;
+    };
+    is_true_env_value(&value)
+}
+
 fn is_false_env_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "off" | "no" | "disable" | "disabled"
+    )
+}
+
+fn is_true_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "enable" | "enabled"
     )
 }
 
@@ -969,6 +992,76 @@ fn hook_tool_name(payload: &Value) -> String {
         .or_else(|| string_member(payload, "toolName"))
         .or_else(|| string_member(payload, "name"))
         .unwrap_or_default()
+}
+
+fn hook_files(payload: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_path_like(payload, &mut out);
+    for key in ["tool_input", "toolInput", "input"] {
+        if let Some(nested) = payload.get(key) {
+            collect_path_like(nested, &mut out);
+        }
+    }
+    dedupe(out)
+}
+
+fn hook_symbols(payload: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_items(payload.get("symbol"), &mut out);
+    collect_items(payload.get("symbols"), &mut out);
+    for key in ["tool_input", "toolInput", "input"] {
+        if let Some(nested) = payload.get(key) {
+            collect_items(nested.get("symbol"), &mut out);
+            collect_items(nested.get("symbols"), &mut out);
+        }
+    }
+    dedupe(out)
+}
+
+fn collect_path_like(value: &Value, out: &mut Vec<String>) {
+    for key in [
+        "file_path",
+        "filePath",
+        "path",
+        "notebook_path",
+        "notebookPath",
+        "files",
+        "paths",
+    ] {
+        collect_items(value.get(key), out);
+    }
+}
+
+fn collect_items(value: Option<&Value>, out: &mut Vec<String>) {
+    match value {
+        Some(Value::String(item)) if !item.trim().is_empty() => out.push(item.trim().to_string()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                collect_items(Some(item), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dedupe(items: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn join_scope(existing: &str, discovered: Vec<String>) -> String {
+    let mut items = hsp_wire::BusScope::parse(existing, "", "").files;
+    for item in discovered {
+        if !items.contains(&item) {
+            items.push(item);
+        }
+    }
+    items.join(",")
 }
 
 fn hook_status_value(payload: &Value) -> String {
@@ -997,6 +1090,34 @@ fn is_build_after_hook(kind: &str, payload: &Value, command: &str) -> bool {
     matches!(kind, "tool.after" | "bash.after" | "post_tool")
         && hook_tool_name(payload) == "Bash"
         && command_gate_spec_from_line(command).is_some()
+}
+
+fn is_edit_before_hook(kind: &str) -> bool {
+    matches!(kind, "edit.before" | "write.before")
+}
+
+fn edit_gate(workspace_root: &str, agent_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut params = Map::new();
+    params.insert("workspace_root".to_string(), json!(workspace_root));
+    params.insert("agent_id".to_string(), json!(agent_id));
+    params.insert(
+        "mode".to_string(),
+        json!(
+            std::env::var("HSP_EDIT_GATE_SCOPE")
+                .unwrap_or_else(|_| "workgroup".to_string())
+        ),
+    );
+    Ok(request("bus.edit_gate", params, true)?)
+}
+
+fn edit_denial_reason(gate: &Value) -> String {
+    let reason = gate
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!(
+        "Edit denied by HSP workgroup policy: no active ticket is held for this workspace. Start work with hsp.ticket(\"...\") or `hsp log ticket --message \"...\"`, then retry the edit.\n\nedit gate: denied ({reason})"
+    )
 }
 
 fn string_member(value: &Value, key: &str) -> Option<String> {

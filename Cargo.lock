@@ -175,6 +175,7 @@ name = "hsp"
 version = "0.1.0"
 dependencies = [
  "hsp-broker",
+ "hsp-build",
  "hsp-bus",
  "hsp-client",
  "hsp-daemon",
@@ -200,6 +201,10 @@ dependencies = [
  "hsp-wire",
  "serde_json",
 ]
+
+[[package]]
+name = "hsp-build"
+version = "0.1.0"
 
 [[package]]
 name = "hsp-bus"

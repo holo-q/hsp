@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/hsp-build",
     "crates/hsp-broker",
     "crates/hsp-bus",
     "crates/hsp-client",
@@ -23,6 +24,7 @@ license = "MIT"
 
 [workspace.dependencies]
 hsp-broker = { path = "crates/hsp-broker" }
+hsp-build = { path = "crates/hsp-build" }
 hsp-bus = { path = "crates/hsp-bus" }
 hsp-client = { path = "crates/hsp-client" }
 hsp-daemon = { path = "crates/hsp-daemon" }
@@ -48,6 +50,7 @@ license.workspace = true
 
 [dependencies]
 hsp-broker.workspace = true
+hsp-build.workspace = true
 hsp-bus.workspace = true
 hsp-client.workspace = true
 hsp-daemon.workspace = true

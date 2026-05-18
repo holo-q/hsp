@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use hsp_build::{command_gate_spec, command_gate_spec_from_line};
 use serde_json::{Map, Value, json};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -22,6 +23,8 @@ pub fn run() -> CliResult {
         "log" => log_command(&args[1..]),
         "mcp" => crate::mcp::run(),
         "run" => run_command(&args[1..]),
+        "wrap" => wrap_command(&args[1..]),
+        "cargo" | "spaceship" => wrapped_alias_command(command, &args[1..]),
         "watch" => watch_command(&args[1..]),
         "ping" => request_and_print("ping", Map::new(), true),
         "status" => request_and_print("status", Map::new(), true),
@@ -71,8 +74,62 @@ fn hook_command(args: &[OsString]) -> CliResult {
     let mut options = HookOptions::parse(args)?;
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload)?;
+    if !hooks_enabled() {
+        return Ok(());
+    }
+    let payload_value = serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null);
     if options.message.is_empty() {
         options.message = hook_message(&payload);
+    }
+    let command = hook_command_value(&payload_value);
+    if is_build_before_hook(&options.kind, &payload_value, &command) {
+        let Some(spec) = command_gate_spec_from_line(&command) else {
+            return Ok(());
+        };
+        let files = if options.files.is_empty() {
+            spec.files_csv()
+        } else {
+            options.files.clone()
+        };
+        let full_workspace = options.files.is_empty() && spec.full_workspace;
+        let gate = wait_for_build_gate_scope(
+            &options.workspace_root,
+            &options.agent_id,
+            hook_build_gate_timeout_seconds(),
+            &files,
+            &options.symbols,
+            full_workspace,
+        )?;
+        if !gate
+            .get("unlocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "build gate locked: {}",
+                gate.get("reason").and_then(Value::as_str).unwrap_or("unknown")
+            );
+            std::process::exit(124);
+        }
+        return Ok(());
+    }
+    let build_after_spec = if is_build_after_hook(&options.kind, &payload_value, &command) {
+        command_gate_spec_from_line(&command)
+    } else {
+        None
+    };
+    if let Some(spec) = &build_after_spec {
+        options.kind = "test.ran".to_string();
+        options.message = command.clone();
+        if options.targets.is_empty() {
+            options.targets = spec.targets();
+        }
+        if options.files.is_empty() {
+            options.files = spec.files_csv();
+        }
+        if options.status.is_empty() {
+            options.status = build_status(&hook_status_value(&payload_value));
+        }
     }
 
     let mut params = Map::new();
@@ -90,6 +147,11 @@ fn hook_command(args: &[OsString]) -> CliResult {
     insert_metadata(&mut metadata, "status", &options.status);
     insert_metadata(&mut metadata, "targets", &options.targets);
     insert_metadata(&mut metadata, "commit", &options.commit);
+    if let Some(spec) = &build_after_spec {
+        insert_metadata(&mut metadata, "tool", &spec.tool);
+        insert_metadata(&mut metadata, "phase", spec.phase.as_str());
+        insert_metadata(&mut metadata, "detector", "hsp-build");
+    }
     if !payload.trim().is_empty() {
         insert_metadata(&mut metadata, "hook_payload", payload.trim());
     }
@@ -196,6 +258,32 @@ fn run_command(args: &[OsString]) -> CliResult {
         return Ok(());
     }
     let options = RunOptions::parse(args)?;
+    execute_run(options, false)
+}
+
+fn wrap_command(args: &[OsString]) -> CliResult {
+    if args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| matches!(arg, "-h" | "--help" | "help"))
+    {
+        print_wrap_help();
+        return Ok(());
+    }
+    let options = RunOptions::parse(args)?;
+    execute_run(options, true)
+}
+
+fn wrapped_alias_command(command: &str, args: &[OsString]) -> CliResult {
+    let mut wrapped = vec![OsString::from(command)];
+    wrapped.extend_from_slice(args);
+    execute_run(RunOptions::parse(&wrapped)?, true)
+}
+
+fn execute_run(options: RunOptions, require_build_command: bool) -> CliResult {
+    if require_build_command && options.build_tool.is_empty() {
+        return err("hsp wrap only runs recognized build/check/test commands");
+    }
     let gate = wait_for_build_gate(&options)?;
     if !gate
         .get("unlocked")
@@ -228,6 +316,9 @@ struct RunOptions {
     no_log: bool,
     workspace_root: String,
     agent_id: String,
+    full_workspace: bool,
+    build_tool: String,
+    build_phase: String,
 }
 
 impl RunOptions {
@@ -242,9 +333,15 @@ impl RunOptions {
             no_log: false,
             workspace_root: std::env::current_dir()?.to_string_lossy().into_owned(),
             agent_id: default_agent_id(),
+            full_workspace: true,
+            build_tool: String::new(),
+            build_phase: String::new(),
         };
 
         let mut index = 0;
+        let mut kind_set = false;
+        let mut files_set = false;
+        let mut message_set = false;
         while index < args.len() {
             let arg = args[index].to_string_lossy();
             if arg == "--" {
@@ -264,6 +361,7 @@ impl RunOptions {
                 }
                 "--kind" => {
                     index += 1;
+                    kind_set = true;
                     options.kind = args
                         .get(index)
                         .ok_or("--kind requires a value")?
@@ -272,6 +370,7 @@ impl RunOptions {
                 }
                 "--files" => {
                     index += 1;
+                    files_set = true;
                     options.files = args
                         .get(index)
                         .ok_or("--files requires a value")?
@@ -288,6 +387,7 @@ impl RunOptions {
                 }
                 "--message" => {
                     index += 1;
+                    message_set = true;
                     options.message = args
                         .get(index)
                         .ok_or("--message requires a value")?
@@ -326,26 +426,71 @@ impl RunOptions {
         if options.argv.is_empty() {
             return err("hsp run requires a command after --");
         }
+        options.apply_build_profile(kind_set, files_set, message_set);
         Ok(options)
+    }
+
+    fn apply_build_profile(&mut self, kind_set: bool, files_set: bool, message_set: bool) {
+        let argv = self
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let Some(spec) = command_gate_spec(&argv) else {
+            self.full_workspace = self.files.is_empty();
+            return;
+        };
+        if !kind_set {
+            self.kind = "test.ran".to_string();
+        }
+        if !files_set {
+            self.files = spec.files_csv();
+            self.full_workspace = spec.full_workspace;
+        } else {
+            self.full_workspace = self.files.is_empty();
+        }
+        if !message_set {
+            self.message = spec.targets();
+        }
+        self.build_tool = spec.tool;
+        self.build_phase = spec.phase.as_str().to_string();
     }
 }
 
 fn wait_for_build_gate(options: &RunOptions) -> Result<Value, Box<dyn std::error::Error>> {
+    wait_for_build_gate_scope(
+        &options.workspace_root,
+        &options.agent_id,
+        options.timeout_seconds,
+        &options.files,
+        &options.symbols,
+        options.full_workspace,
+    )
+}
+
+fn wait_for_build_gate_scope(
+    workspace_root: &str,
+    agent_id: &str,
+    timeout_seconds: f64,
+    files: &str,
+    symbols: &str,
+    full_workspace: bool,
+) -> Result<Value, Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     loop {
         let mut params = Map::new();
-        params.insert("workspace_root".to_string(), json!(options.workspace_root));
-        params.insert("agent_id".to_string(), json!(options.agent_id));
+        params.insert("workspace_root".to_string(), json!(workspace_root));
+        params.insert("agent_id".to_string(), json!(agent_id));
         params.insert("now".to_string(), json!(now_seconds()));
-        params.insert("files".to_string(), json!(options.files));
-        params.insert("symbols".to_string(), json!(options.symbols));
-        params.insert("full_workspace".to_string(), json!(options.files.is_empty()));
+        params.insert("files".to_string(), json!(files));
+        params.insert("symbols".to_string(), json!(symbols));
+        params.insert("full_workspace".to_string(), json!(full_workspace));
         let gate = request("bus.build_gate", params, true)?;
         if gate
             .get("unlocked")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            || started.elapsed().as_secs_f64() >= options.timeout_seconds
+            || started.elapsed().as_secs_f64() >= timeout_seconds
         {
             return Ok(gate);
         }
@@ -374,13 +519,28 @@ fn log_run_result(options: &RunOptions, passed: bool) -> Result<(), Box<dyn std:
     params.insert("symbols".to_string(), json!(options.symbols));
     params.insert("event_type".to_string(), json!(options.kind));
     params.insert("kind".to_string(), json!(options.kind));
-    params.insert(
-        "metadata".to_string(),
-        json!({
-            "status": if passed { "passed" } else { "failed" },
-            "targets": options.argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" "),
-        }),
+    let mut metadata = BTreeMap::new();
+    insert_metadata(
+        &mut metadata,
+        "status",
+        if passed { "passed" } else { "failed" },
     );
+    insert_metadata(
+        &mut metadata,
+        "targets",
+        &options
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    insert_metadata(&mut metadata, "tool", &options.build_tool);
+    insert_metadata(&mut metadata, "phase", &options.build_phase);
+    if !options.build_tool.is_empty() {
+        insert_metadata(&mut metadata, "detector", "hsp-build");
+    }
+    params.insert("metadata".to_string(), serde_json::to_value(metadata)?);
     request("bus.event", params, true)?;
     Ok(())
 }
@@ -759,6 +919,79 @@ fn hook_message(payload: &str) -> String {
     raw.lines().next().unwrap_or("").chars().take(500).collect()
 }
 
+fn hooks_enabled() -> bool {
+    let Ok(value) = std::env::var("HSP_HOOKS") else {
+        return true;
+    };
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no" | "disable" | "disabled"
+    )
+}
+
+fn hook_command_value(payload: &Value) -> String {
+    string_member(payload, "command")
+        .or_else(|| nested_string_member(payload, "tool_input", "command"))
+        .or_else(|| nested_string_member(payload, "toolInput", "command"))
+        .or_else(|| nested_string_member(payload, "input", "command"))
+        .unwrap_or_default()
+}
+
+fn hook_tool_name(payload: &Value) -> String {
+    string_member(payload, "tool_name")
+        .or_else(|| string_member(payload, "toolName"))
+        .or_else(|| string_member(payload, "name"))
+        .unwrap_or_default()
+}
+
+fn hook_status_value(payload: &Value) -> String {
+    string_member(payload, "status")
+        .or_else(|| nested_string_member(payload, "tool_response", "status"))
+        .or_else(|| nested_string_member(payload, "toolResponse", "status"))
+        .or_else(|| nested_string_member(payload, "response", "status"))
+        .unwrap_or_default()
+}
+
+fn build_status(status: &str) -> String {
+    match status {
+        "success" | "passed" | "ok" => "passed".to_string(),
+        "error" | "failed" | "interrupted" => "failed".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn is_build_before_hook(kind: &str, payload: &Value, command: &str) -> bool {
+    matches!(kind, "tool.before" | "bash.before" | "pre_tool")
+        && hook_tool_name(payload) == "Bash"
+        && command_gate_spec_from_line(command).is_some()
+}
+
+fn is_build_after_hook(kind: &str, payload: &Value, command: &str) -> bool {
+    matches!(kind, "tool.after" | "bash.after" | "post_tool")
+        && hook_tool_name(payload) == "Bash"
+        && command_gate_spec_from_line(command).is_some()
+}
+
+fn string_member(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn nested_string_member(value: &Value, outer: &str, inner: &str) -> Option<String> {
+    value.get(outer).and_then(|nested| string_member(nested, inner))
+}
+
+fn hook_build_gate_timeout_seconds() -> f64 {
+    std::env::var("HSP_BUILD_GATE_TIMEOUT")
+        .ok()
+        .and_then(|value| parse_duration_seconds(&value).ok())
+        .unwrap_or(120.0)
+}
+
 fn default_agent_id() -> String {
     std::env::var("HSP_AGENT_ID")
         .or_else(|_| std::env::var("CODEX_AGENT_ID"))
@@ -823,6 +1056,8 @@ fn print_help() {
     println!("  hsp hook stdin <kind> [options]");
     println!("  hsp log <action> [options]");
     println!("  hsp run [options] -- <command>");
+    println!("  hsp wrap [options] -- <build-command>");
+    println!("  hsp cargo|spaceship <args...>");
     println!("  hsp watch [path...] [--once] [--global]");
     println!("  hsp global");
 }
@@ -849,6 +1084,20 @@ fn print_watch_help() {
 
 fn print_run_help() {
     println!("hsp run [options] -- <command>");
+    println!("options:");
+    println!("  --timeout <duration>");
+    println!("  --kind <event-kind>");
+    println!("  --files <scope>");
+    println!("  --symbols <scope>");
+    println!("  --message <text>");
+    println!("  --workspace-root <path>");
+    println!("  --agent-id <id>");
+    println!("  --no-log");
+}
+
+fn print_wrap_help() {
+    println!("hsp wrap [options] -- <build-command>");
+    println!("hsp cargo|spaceship <args...>");
     println!("options:");
     println!("  --timeout <duration>");
     println!("  --kind <event-kind>");

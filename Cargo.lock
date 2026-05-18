@@ -187,6 +187,7 @@ dependencies = [
  "hsp-store",
  "hsp-wire",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

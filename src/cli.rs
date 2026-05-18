@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hsp_build::{command_gate_spec, command_gate_spec_from_line};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
+const BUILD_BATCH_CAPTURE_LIMIT: usize = 12_000;
+const BUILD_BATCH_DEFAULT_TTL_SECONDS: f64 = 30.0;
+const BUILD_BATCH_DEFAULT_WAIT_SECONDS: f64 = 1800.0;
 
 pub fn run() -> CliResult {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -105,11 +111,23 @@ fn hook_command(args: &[OsString]) -> CliResult {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            eprintln!(
-                "build gate locked: {}",
-                gate.get("reason").and_then(Value::as_str).unwrap_or("unknown")
-            );
+            eprintln!("{}", build_gate_message(&gate));
             std::process::exit(124);
+        }
+        if gate.get("reason").and_then(Value::as_str) == Some("all_waiting")
+            && authoritative_build_enabled()
+        {
+            let batch = run_authoritative_build_batch(
+                &command,
+                &gate,
+                &options.workspace_root,
+                &files,
+                full_workspace,
+                &spec.tool,
+                spec.phase.as_str(),
+            )?;
+            write_hook_denial(&build_batch_denial_reason(&batch))?;
+            return Ok(());
         }
         return Ok(());
     }
@@ -923,7 +941,16 @@ fn hooks_enabled() -> bool {
     let Ok(value) = std::env::var("HSP_HOOKS") else {
         return true;
     };
-    !matches!(
+    !is_false_env_value(&value)
+}
+
+fn authoritative_build_enabled() -> bool {
+    let value = std::env::var("HSP_AUTHORITATIVE_BUILD").unwrap_or_else(|_| "1".to_string());
+    !is_false_env_value(&value)
+}
+
+fn is_false_env_value(value: &str) -> bool {
+    matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "off" | "no" | "disable" | "disabled"
     )
@@ -990,6 +1017,332 @@ fn hook_build_gate_timeout_seconds() -> f64 {
         .ok()
         .and_then(|value| parse_duration_seconds(&value).ok())
         .unwrap_or(120.0)
+}
+
+#[derive(Debug, Clone)]
+struct BuildBatchResult {
+    command: String,
+    key: String,
+    owner: bool,
+    returncode: i32,
+    status: String,
+    stdout: String,
+    stderr: String,
+    timestamp: f64,
+}
+
+impl BuildBatchResult {
+    fn to_json(&self) -> Value {
+        json!({
+            "command": self.command,
+            "key": self.key,
+            "owner": self.owner,
+            "returncode": self.returncode,
+            "status": self.status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "timestamp": self.timestamp,
+        })
+    }
+
+    fn from_json(value: Value) -> Option<Self> {
+        let object = value.as_object()?;
+        Some(Self {
+            command: object.get("command")?.as_str()?.to_string(),
+            key: object.get("key")?.as_str()?.to_string(),
+            owner: object.get("owner").and_then(Value::as_bool).unwrap_or(false),
+            returncode: object
+                .get("returncode")
+                .and_then(Value::as_i64)
+                .unwrap_or(1) as i32,
+            status: object
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+                .to_string(),
+            stdout: object
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            stderr: object
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            timestamp: object
+                .get("timestamp")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+        })
+    }
+
+    fn with_owner(mut self, owner: bool) -> Self {
+        self.owner = owner;
+        self
+    }
+}
+
+fn run_authoritative_build_batch(
+    command: &str,
+    gate: &Value,
+    workspace_root: &str,
+    files: &str,
+    full_workspace: bool,
+    tool: &str,
+    phase: &str,
+) -> Result<BuildBatchResult, Box<dyn std::error::Error>> {
+    let root = PathBuf::from(workspace_root);
+    let directory = root.join("tmp").join("hsp-build-batches");
+    fs::create_dir_all(&directory)?;
+    let gate_text = serde_json::to_string(gate)?;
+    let key = build_batch_key(&root, command, &gate_text);
+    let result_path = directory.join(format!("{key}.json"));
+    let lock_path = directory.join(format!("{key}.lock"));
+    let ttl = duration_env("HSP_BUILD_BATCH_TTL", BUILD_BATCH_DEFAULT_TTL_SECONDS);
+    let wait_timeout = duration_env(
+        "HSP_BUILD_BATCH_WAIT_TIMEOUT",
+        BUILD_BATCH_DEFAULT_WAIT_SECONDS,
+    );
+
+    if let Some(result) = read_fresh_batch_result(&result_path, ttl) {
+        return Ok(result.with_owner(false));
+    }
+    if try_create_lock(&lock_path, ttl)? {
+        let result = run_build_command(command, &root, &key)?.with_owner(true);
+        write_batch_result(&result_path, &result)?;
+        record_authoritative_build_result(
+            command,
+            &result,
+            workspace_root,
+            files,
+            full_workspace,
+            tool,
+            phase,
+        )?;
+        let _ = fs::remove_file(lock_path);
+        return Ok(result);
+    }
+    if let Some(result) = wait_for_batch_result(&result_path, wait_timeout) {
+        return Ok(result.with_owner(false));
+    }
+    Ok(BuildBatchResult {
+        command: command.to_string(),
+        key,
+        owner: false,
+        returncode: 124,
+        status: "failed".to_string(),
+        stdout: String::new(),
+        stderr: format!("timed out waiting for HSP build batch result after {wait_timeout:.0}s"),
+        timestamp: now_seconds(),
+    })
+}
+
+fn build_batch_key(root: &Path, command: &str, gate: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(command.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(gate.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}").chars().take(24).collect()
+}
+
+fn run_build_command(
+    command: &str,
+    root: &Path,
+    key: &str,
+) -> Result<BuildBatchResult, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .output()?;
+    let returncode = output.status.code().unwrap_or(1);
+    Ok(BuildBatchResult {
+        command: command.to_string(),
+        key: key.to_string(),
+        owner: false,
+        returncode,
+        status: if returncode == 0 { "passed" } else { "failed" }.to_string(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        timestamp: now_seconds(),
+    })
+}
+
+fn record_authoritative_build_result(
+    command: &str,
+    result: &BuildBatchResult,
+    workspace_root: &str,
+    files: &str,
+    full_workspace: bool,
+    tool: &str,
+    phase: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut params = Map::new();
+    params.insert("workspace_root".to_string(), json!(workspace_root));
+    params.insert("agent_id".to_string(), json!(default_agent_id()));
+    params.insert("client_id".to_string(), json!(default_client_id()));
+    params.insert("now".to_string(), json!(now_seconds()));
+    params.insert("message".to_string(), json!(command));
+    if !full_workspace && !files.is_empty() {
+        params.insert("files".to_string(), json!(files));
+    }
+    params.insert("event_type".to_string(), json!("test.ran"));
+    params.insert("kind".to_string(), json!("test.ran"));
+    params.insert(
+        "metadata".to_string(),
+        json!({
+            "status": result.status,
+            "targets": command,
+            "tool": tool,
+            "phase": phase,
+            "detector": "hsp-build",
+            "batch_key": result.key,
+            "batch_owner": result.owner,
+        }),
+    );
+    request("bus.event", params, true)?;
+    Ok(())
+}
+
+fn build_batch_denial_reason(result: &BuildBatchResult) -> String {
+    let action = if result.owner {
+        "ran this command once"
+    } else {
+        "reused the batched result"
+    };
+    let mut lines = vec![
+        format!("HSP build mutex {action} for the project and denied duplicate Bash execution."),
+        format!("$ {}", result.command),
+        format!("exit: {}", result.returncode),
+    ];
+    let stdout = truncate_capture(&result.stdout);
+    if !stdout.is_empty() {
+        lines.push("--- stdout ---".to_string());
+        lines.push(stdout);
+    }
+    let stderr = truncate_capture(&result.stderr);
+    if !stderr.is_empty() {
+        lines.push("--- stderr ---".to_string());
+        lines.push(stderr);
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn truncate_capture(text: &str) -> String {
+    if text.len() <= BUILD_BATCH_CAPTURE_LIMIT {
+        return text.trim_end().to_string();
+    }
+    let mut end = 0;
+    for (index, _) in text.char_indices() {
+        if index <= BUILD_BATCH_CAPTURE_LIMIT {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    let head = text[..end].trim_end();
+    format!(
+        "{head}\n... truncated {} char(s)",
+        text.len().saturating_sub(end)
+    )
+}
+
+fn read_fresh_batch_result(path: &Path, ttl: f64) -> Option<BuildBatchResult> {
+    let modified = path.metadata().ok()?.modified().ok()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs_f64();
+    if age > ttl {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    BuildBatchResult::from_json(value)
+}
+
+fn wait_for_batch_result(path: &Path, timeout: f64) -> Option<BuildBatchResult> {
+    let started = std::time::Instant::now();
+    while started.elapsed().as_secs_f64() <= timeout {
+        if let Some(result) =
+            read_fresh_batch_result(path, timeout.max(BUILD_BATCH_DEFAULT_TTL_SECONDS))
+        {
+            return Some(result);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+fn write_batch_result(
+    path: &Path,
+    result: &BuildBatchResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(path, serde_json::to_string(&result.to_json())?)?;
+    Ok(())
+}
+
+fn try_create_lock(path: &Path, ttl: f64) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Ok(metadata) = path.metadata()
+        && let Ok(modified) = metadata.modified()
+        && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
+        && age.as_secs_f64() > ttl
+    {
+        let _ = fs::remove_file(path);
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            writeln!(file, "{}", std::process::id())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn duration_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_duration_seconds(&value).ok())
+        .unwrap_or(default)
+}
+
+fn build_gate_message(gate: &Value) -> String {
+    let reason = gate
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut text = format!("build gate locked: {reason}");
+    if let Some(scope) = gate.get("scope").and_then(Value::as_object)
+        && let Some(files) = scope.get("files").and_then(Value::as_array)
+        && !files.is_empty()
+    {
+        let joined = files
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        if !joined.is_empty() {
+            text.push_str(&format!("\nscope: {joined}"));
+        }
+    }
+    text
+}
+
+fn write_hook_denial(reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    });
+    print!("{}", serde_json::to_string(&output)?);
+    Ok(())
 }
 
 fn default_agent_id() -> String {

@@ -158,6 +158,9 @@ fn hook_command(args: &[OsString]) -> CliResult {
             options.status = build_status(&hook_status_value(&payload_value));
         }
     }
+    if let Some(context) = hook_context_notice(&options, &payload_value)? {
+        println!("{context}");
+    }
 
     let mut params = Map::new();
     params.insert("workspace_root".to_string(), json!(options.workspace_root));
@@ -965,6 +968,11 @@ fn require_ticket_for_edits() -> bool {
     is_true_env_value(&value)
 }
 
+fn hook_context_enabled() -> bool {
+    let value = std::env::var("HSP_HOOK_CONTEXT").unwrap_or_else(|_| "1".to_string());
+    !is_false_env_value(&value)
+}
+
 fn is_false_env_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -1118,6 +1126,120 @@ fn edit_denial_reason(gate: &Value) -> String {
     format!(
         "Edit denied by HSP workgroup policy: no active ticket is held for this workspace. Start work with hsp.ticket(\"...\") or `hsp log ticket --message \"...\"`, then retry the edit.\n\nedit gate: denied ({reason})"
     )
+}
+
+fn hook_context_notice(
+    options: &HookOptions,
+    payload: &Value,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !hook_context_enabled()
+        || !is_context_hook(&options.kind, payload)
+        || (options.files.is_empty() && options.symbols.is_empty())
+    {
+        return Ok(None);
+    }
+    let mut params = Map::new();
+    params.insert("workspace_root".to_string(), json!(options.workspace_root));
+    params.insert("agent_id".to_string(), json!(options.agent_id));
+    params.insert("client_id".to_string(), json!(options.client_id));
+    params.insert("now".to_string(), json!(now_seconds()));
+    params.insert("limit".to_string(), json!(10));
+    insert_string(&mut params, "files", &options.files);
+    insert_string(&mut params, "symbols", &options.symbols);
+    let recent = match request("bus.recent", params, true) {
+        Ok(recent) => recent,
+        Err(error) => return Ok(Some(format!("hsp context unavailable: {error}"))),
+    };
+    let body = render_hook_context(&recent);
+    if body.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "hsp context for {}:\n{body}",
+        hook_context_target(&options.files, &options.symbols)
+    )))
+}
+
+fn is_context_hook(kind: &str, payload: &Value) -> bool {
+    let tool = hook_tool_name(payload);
+    if matches!(kind, "read.before" | "read.after") {
+        return true;
+    }
+    if matches!(kind, "edit.before" | "edit.after") {
+        return tool.is_empty()
+            || matches!(
+                tool.as_str(),
+                "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
+            );
+    }
+    matches!(kind, "tool.before" | "tool.after")
+        && matches!(tool.as_str(), "Read" | "NotebookRead")
+}
+
+fn hook_context_target(files: &str, symbols: &str) -> String {
+    let scope = hsp_wire::BusScope::parse(files, symbols, "");
+    let mut items = scope.files;
+    for symbol in scope.symbols {
+        if !items.contains(&symbol) {
+            items.push(symbol);
+        }
+    }
+    if items.is_empty() {
+        "scope".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn render_hook_context(recent: &Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(tickets) = recent.get("active_tickets").and_then(Value::as_array) {
+        for ticket in tickets {
+            if let Some(line) = compact_ticket(ticket) {
+                lines.push(line);
+            }
+        }
+    }
+    if let Some(questions) = recent.get("open_questions").and_then(Value::as_array) {
+        for question in questions {
+            if let Some(line) = compact_question(question) {
+                lines.push(line);
+            }
+        }
+    }
+    if let Some(events) = recent.get("events").and_then(Value::as_array) {
+        for event in events {
+            lines.push(compact_event(event));
+        }
+    }
+    if recent
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        lines.push("... truncated".to_string());
+    }
+    lines.join("\n")
+}
+
+fn compact_ticket(ticket: &Value) -> Option<String> {
+    let id = ticket.get("ticket_id").and_then(Value::as_str)?;
+    let message = ticket.get("message").and_then(Value::as_str).unwrap_or("");
+    let holders = ticket
+        .get("holders")
+        .and_then(Value::as_object)
+        .map(|holders| holders.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    Some(format!("{id} {message} [{holders}]"))
+}
+
+fn compact_question(question: &Value) -> Option<String> {
+    let id = question
+        .get("question_id")
+        .or_else(|| question.get("id"))
+        .and_then(Value::as_str)?;
+    let message = question.get("message").and_then(Value::as_str).unwrap_or("");
+    Some(format!("{id} {message}"))
 }
 
 fn string_member(value: &Value, key: &str) -> Option<String> {

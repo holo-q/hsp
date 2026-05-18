@@ -700,7 +700,7 @@ fn bus_params(arguments: &Map<String, Value>, action: &str) -> McpResult<Map<Str
     params.insert("workspace_root".to_string(), json!(workspace_root(arguments)?));
     params.insert("agent_id".to_string(), json!(default_agent_id()));
     params.insert("client_id".to_string(), json!(default_client_id()));
-    params.insert("session_id".to_string(), json!(default_client_id()));
+    params.insert("session_id".to_string(), json!(default_session_id()));
     params.insert("now".to_string(), json!(now_seconds()));
     insert_argument(&mut params, arguments, "title");
     insert_argument(&mut params, arguments, "message");
@@ -1263,6 +1263,13 @@ fn default_agent_id() -> String {
 
 fn default_client_id() -> String {
     std::env::var("HSP_CLIENT_ID").unwrap_or_else(|_| "hsp-mcp".to_string())
+}
+
+fn default_session_id() -> String {
+    std::env::var("HSP_SESSION_ID")
+        .or_else(|_| std::env::var("CODEX_THREAD_ID"))
+        .or_else(|_| std::env::var("CLAUDE_CODE_SESSION_ID"))
+        .unwrap_or_else(|_| default_client_id())
 }
 
 fn now_seconds() -> f64 {

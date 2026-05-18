@@ -707,6 +707,7 @@ impl WatchOptions {
 #[derive(Debug, Clone)]
 struct LogOptions {
     action: String,
+    title: String,
     message: String,
     files: String,
     symbols: String,
@@ -732,6 +733,7 @@ impl LogOptions {
             } else {
                 action.to_string()
             },
+            title: String::new(),
             message: String::new(),
             files: String::new(),
             symbols: String::new(),
@@ -753,10 +755,10 @@ impl LogOptions {
         while index < args.len() {
             let flag = args[index].to_string_lossy();
             let value = match flag.as_ref() {
-                "--message" | "--files" | "--symbols" | "--aliases" | "--id" | "--timeout"
-                | "--kind" | "--status" | "--targets" | "--commit" | "--workspace-root"
-                | "--root" | "--agent-id" | "--client-id" | "--limit" | "--after-id"
-                | "--after-seq" => {
+                "--title" | "--message" | "--files" | "--symbols" | "--aliases" | "--id"
+                | "--timeout" | "--kind" | "--status" | "--targets" | "--commit"
+                | "--workspace-root" | "--root" | "--agent-id" | "--client-id" | "--limit"
+                | "--after-id" | "--after-seq" => {
                     index += 1;
                     args.get(index)
                         .ok_or_else(|| format!("{flag} requires a value"))?
@@ -767,6 +769,7 @@ impl LogOptions {
             };
 
             match flag.as_ref() {
+                "--title" => options.title = value,
                 "--message" => options.message = value,
                 "--files" => options.files = value,
                 "--symbols" => options.symbols = value,
@@ -822,6 +825,7 @@ impl LogOptions {
         insert_string(&mut params, "agent_id", &self.agent_id);
         insert_string(&mut params, "client_id", &self.client_id);
         params.insert("now".to_string(), json!(now_seconds()));
+        insert_string(&mut params, "title", &self.title);
         insert_string(&mut params, "message", &self.message);
         insert_string(&mut params, "files", &self.files);
         insert_string(&mut params, "symbols", &self.symbols);
@@ -1134,7 +1138,7 @@ fn edit_denial_reason(gate: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     format!(
-        "Edit denied by HSP workgroup policy: no active ticket is held for this workspace. Start work with hsp.ticket(\"...\") or `hsp log ticket --message \"...\"`, then retry the edit.\n\nedit gate: denied ({reason})"
+        "Edit denied by HSP workgroup policy: no active ticket is held for this workspace. Start work with hsp.ticket(\"fix-ticket-title\") or `hsp log ticket --title \"fix-ticket-title\"`, then retry the edit.\n\nedit gate: denied ({reason})"
     )
 }
 
@@ -1685,9 +1689,10 @@ fn print_log_help() {
     println!("  recent settle precommit postcommit weather presence status");
     println!("  build_gate edit_gate");
     println!("options:");
-    println!("  --message --files --symbols --aliases --id --timeout --kind");
+    println!("  --title --message --files --symbols --aliases --id --timeout --kind");
     println!("  --status --targets --commit --workspace-root --agent-id --client-id");
     println!("  --limit --after-id");
+    println!("ticket titles: use lowercase hyphen slugs such as fix-build-gate-timeout");
 }
 
 fn print_watch_help() {

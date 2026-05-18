@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hsp_bus::{
     BusEventWire, BusJournal, DEFAULT_JOURNAL_LIMIT, DEFAULT_RECENT_LIMIT, EditGateMode,
     EventQuery, JournalAppend, QuestionClose, QuestionOpen, TicketBoard, TicketEffectKind,
-    TicketIntent,
+    TicketIntent, validate_ticket_title,
 };
 use hsp_lsp::LspRuntime;
 use hsp_render::{AliasIdentity, AliasKind, AliasRecord, AliasResolution, RenderMemory};
@@ -303,7 +303,24 @@ impl BrokerCore {
         let workspace_root = workspace_root(&request.params);
         self.ensure_workspace_loaded(&workspace_root)?;
         let agent_id = agent_id(&request.params);
-        let message = optional_string(&request.params, "message")?.unwrap_or_default();
+        let title = optional_string(&request.params, "title")?;
+        let legacy_message = optional_string(&request.params, "message")?;
+        let message = match (title, legacy_message) {
+            (Some(title), _) => title,
+            (None, Some(message)) if message.trim().is_empty() => message,
+            (None, Some(_)) => {
+                return Err(BrokerWireError::new(
+                    BrokerErrorCode::InvalidParams,
+                    "ticket title is required for start/join; pass title/--title with a scan-friendly slug, or an empty message only to release",
+                ));
+            }
+            (None, None) => String::new(),
+        };
+        if !message.trim().is_empty() {
+            validate_ticket_title(&message).map_err(|error| {
+                BrokerWireError::new(BrokerErrorCode::InvalidParams, error.to_string())
+            })?;
+        }
         let mut intent = TicketIntent::new(workspace_root.clone(), agent_id.clone(), message);
         intent.scope = scope_from_params(&request.params);
         intent.projects = project_roots(&request.params);
@@ -1426,7 +1443,7 @@ mod tests {
                 "params": {
                     "workspace_root": root,
                     "agent_id": "agent-a",
-                    "message": "persistent ticket",
+                    "title": "feat-persistent-ticket",
                     "files": "src/lib.rs",
                     "now": 100.0
                 }
@@ -1579,7 +1596,7 @@ mod tests {
                 "params": {
                     "workspace_root": "/repo",
                     "agent_id": "agent-a",
-                    "message": "edit server",
+                    "title": "fix-edit-server",
                 },
             }),
         );
@@ -1591,7 +1608,7 @@ mod tests {
                 "params": {
                     "workspace_root": "/repo",
                     "agent_id": "agent-b",
-                    "message": "edit server",
+                    "title": "fix-edit-server",
                 },
             }),
         );
@@ -1622,6 +1639,60 @@ mod tests {
         assert_eq!(one_waiting["result"]["unlocked"], json!(false));
         assert_eq!(all_waiting["result"]["reason"], json!("all_waiting"));
         assert_eq!(all_waiting["result"]["unlocked"], json!(true));
+    }
+
+    #[test]
+    fn bus_ticket_requires_scan_friendly_title() {
+        let mut core = BrokerCore::ephemeral_at(10.0);
+        let invalid = handle(
+            &mut core,
+            json!({
+                "id": "invalid",
+                "method": "bus.ticket",
+                "params": {
+                    "workspace_root": "/repo",
+                    "agent_id": "agent-a",
+                    "title": "edit server",
+                },
+            }),
+        );
+        assert_eq!(invalid["error"]["code"], json!("invalid_params"));
+        assert!(invalid["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("ticket title"));
+
+        let valid = handle(
+            &mut core,
+            json!({
+                "id": "valid",
+                "method": "bus.ticket",
+                "params": {
+                    "workspace_root": "/repo",
+                    "agent_id": "agent-a",
+                    "title": "fix-edit-server",
+                },
+            }),
+        );
+        assert_eq!(valid["result"]["ticket"]["message"], json!("fix-edit-server"));
+
+        let legacy_start = handle(
+            &mut core,
+            json!({
+                "id": "legacy-start",
+                "method": "bus.ticket",
+                "params": {
+                    "workspace_root": "/repo",
+                    "agent_id": "agent-b",
+                    "message": "fix-edit-server",
+                },
+            }),
+        );
+        assert_eq!(legacy_start["error"]["code"], json!("invalid_params"));
+        assert!(legacy_start["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("title is required"));
     }
 
     #[test]
@@ -1677,7 +1748,7 @@ mod tests {
                     "params": {
                         "workspace_root": "/repo",
                         "agent_id": agent_id,
-                        "message": "coordinate journal",
+                        "title": "feat-coordinate-journal",
                     },
                 }),
             );
@@ -1762,7 +1833,7 @@ mod tests {
                 "params": {
                     "workspace_root": "/repo",
                     "agent_id": "agent-b",
-                    "message": "editing server",
+                    "title": "fix-editing-server",
                     "now": 99.0,
                 },
             }),
@@ -2072,7 +2143,7 @@ mod tests {
                 "params": {
                     "workspace_root": "/repo",
                     "agent_id": "agent-b",
-                    "message": "editing",
+                    "title": "fix-editing",
                     "now": 99.0,
                 },
             }),
@@ -2131,7 +2202,7 @@ mod tests {
             json!({
                 "id": "t1",
                 "method": "bus.ticket",
-                "params": {"workspace_root": "/repo", "agent_id": "agent-b", "message": "editing"},
+                "params": {"workspace_root": "/repo", "agent_id": "agent-b", "title": "fix-editing"},
             }),
         );
         let workgroup = handle(

@@ -97,7 +97,7 @@ fn initialize_result(request: &Map<String, Value>) -> Value {
             "name": "hsp",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Rust HSP broker/workgroup tools. LSP tools are still routed by the Python reference until the Rust runtime wave lands.",
+        "instructions": "Rust HSP broker/workgroup tools. Ticket titles must be lowercase hyphen-separated slugs prefixed with fix, feat, docs, refactor, test, chore, perf, build, ci, style, revert, review, debug, ops, or release, for example feat-ticket-title. LSP tools are still routed by the Python reference until the Rust runtime wave lands.",
     })
 }
 
@@ -128,11 +128,13 @@ fn tools_list() -> Value {
             },
             {
                 "name": "ticket",
-                "description": "Acquire or release this agent's current work ticket.",
+                "description": "Acquire or release this agent's current work ticket. Starting or joining a ticket requires a scan-friendly title: prefix with fix/feat/docs/refactor/test/chore/perf/build/ci/style/revert/review/debug/ops/release and separate words with hyphens, for example feat-ticket-title. Pass an empty title to release.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
+                    "required": ["title"],
                     "properties": {
+                        "title": {"type": "string", "default": ""},
                         "message": {"type": "string", "default": ""},
                         "files": {"type": "string", "default": ""},
                         "symbols": {"type": "string", "default": ""},
@@ -700,6 +702,7 @@ fn bus_params(arguments: &Map<String, Value>, action: &str) -> McpResult<Map<Str
     params.insert("client_id".to_string(), json!(default_client_id()));
     params.insert("session_id".to_string(), json!(default_client_id()));
     params.insert("now".to_string(), json!(now_seconds()));
+    insert_argument(&mut params, arguments, "title");
     insert_argument(&mut params, arguments, "message");
     insert_argument(&mut params, arguments, "files");
     insert_argument(&mut params, arguments, "symbols");

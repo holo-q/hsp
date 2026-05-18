@@ -14,7 +14,7 @@ pub use presence::{
 pub use question::{BusQuestion, BusQuestionWire, QuestionOpen};
 pub use ticket::{
     BuildGate, EditGate, EditGateMode, Ticket, TicketBoard, TicketEffect, TicketEffectKind,
-    TicketHold, TicketIntent,
+    TicketHold, TicketIntent, validate_ticket_title,
 };
 
 pub const DEFAULT_RECENT_LIMIT: usize = 20;

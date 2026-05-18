@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use hsp_wire::{BusEvent, BusEventKind, BusScope};
 use serde::Serialize;
 
+pub const TICKET_TITLE_PREFIXES: &[&str] = &[
+    "fix", "feat", "docs", "refactor", "test", "chore", "perf", "build", "ci", "style",
+    "revert", "review", "debug", "ops", "release",
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Ticket {
     pub ticket_id: String,
@@ -46,6 +51,39 @@ impl TicketIntent {
             now: 0.0,
         }
     }
+}
+
+pub fn validate_ticket_title(title: &str) -> Result<(), &'static str> {
+    let value = title.trim();
+    if value.is_empty() {
+        return Err("ticket title is required; use an empty title only to release the current ticket");
+    }
+    if value != title {
+        return Err("ticket title must not have leading or trailing whitespace");
+    }
+    let Some((prefix, rest)) = value.split_once('-') else {
+        return Err(
+            "ticket title must start with a conventional prefix and hyphen, for example feat-ticket-title",
+        );
+    };
+    if !TICKET_TITLE_PREFIXES.contains(&prefix) {
+        return Err(
+            "ticket title prefix must be one of fix, feat, docs, refactor, test, chore, perf, build, ci, style, revert, review, debug, ops, release",
+        );
+    }
+    if rest.is_empty() {
+        return Err("ticket title needs words after the prefix, for example fix-build-hook-gate");
+    }
+    if rest.starts_with('-') || rest.contains("--") || rest.ends_with('-') {
+        return Err("ticket title words must be separated by single hyphens");
+    }
+    if !rest
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("ticket title must use lowercase ASCII words separated with hyphens");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,6 +595,18 @@ mod tests {
         TicketIntent::new("/repo", agent_id, message)
     }
 
+    #[test]
+    fn ticket_titles_are_scan_friendly_slugs() {
+        assert!(validate_ticket_title("feat-ticket-title").is_ok());
+        assert!(validate_ticket_title("fix-v2-build-hook").is_ok());
+        assert!(validate_ticket_title("ticket title").is_err());
+        assert!(validate_ticket_title("Feat-ticket-title").is_err());
+        assert!(validate_ticket_title("feat_ticket_title").is_err());
+        assert!(validate_ticket_title("feat-").is_err());
+        assert!(validate_ticket_title("feat--ticket").is_err());
+        assert!(validate_ticket_title("ticket-title").is_err());
+    }
+
     fn ticket_event(
         seq: u64,
         kind: BusEventKind,
@@ -591,8 +641,8 @@ mod tests {
     #[test]
     fn tickets_join_release_and_close() {
         let mut board = TicketBoard::new();
-        let first = board.hold(intent("agent-a", "wire team tickets")).expect("ticket");
-        let second = board.hold(intent("agent-b", "wire team tickets")).expect("ticket");
+        let first = board.hold(intent("agent-a", "feat-wire-team-tickets")).expect("ticket");
+        let second = board.hold(intent("agent-b", "feat-wire-team-tickets")).expect("ticket");
 
         assert_eq!(first.ticket_id, "T1");
         assert_eq!(second.ticket_id, "T1");
@@ -610,11 +660,11 @@ mod tests {
     #[test]
     fn reposting_same_ticket_is_idempotent_and_merges_scope() {
         let mut board = TicketBoard::new();
-        let mut first = intent("agent-a", "same ticket");
+        let mut first = intent("agent-a", "feat-same-ticket");
         first.scope = BusScope::parse("src/a.rs", "", "");
         board.hold(first);
 
-        let mut second = intent("agent-a", "same ticket");
+        let mut second = intent("agent-a", "feat-same-ticket");
         second.scope = BusScope::parse("src/b.rs", "", "");
         let ticket = board.hold(second).expect("ticket");
 
@@ -626,9 +676,9 @@ mod tests {
     #[test]
     fn replayed_ticket_events_rehydrate_active_holders_and_next_id() {
         let board = TicketBoard::from_events([
-            ticket_event(1, BusEventKind::TicketStarted, "T4", "agent-a", "rewrite"),
-            ticket_event(2, BusEventKind::TicketJoined, "T4", "agent-b", "rewrite"),
-            ticket_event(3, BusEventKind::TicketReleased, "T4", "agent-a", "rewrite"),
+            ticket_event(1, BusEventKind::TicketStarted, "T4", "agent-a", "refactor-rewrite"),
+            ticket_event(2, BusEventKind::TicketJoined, "T4", "agent-b", "refactor-rewrite"),
+            ticket_event(3, BusEventKind::TicketReleased, "T4", "agent-a", "refactor-rewrite"),
         ]);
 
         let active = board.active_tickets("/repo");
@@ -640,7 +690,7 @@ mod tests {
 
         let mut board = board;
         let fresh = board
-            .hold(TicketIntent::new("/repo", "agent-c", "new lane"))
+            .hold(TicketIntent::new("/repo", "agent-c", "feat-new-lane"))
             .expect("fresh ticket");
         assert_eq!(fresh.ticket_id, "T5");
     }
@@ -648,8 +698,8 @@ mod tests {
     #[test]
     fn build_gate_unlocks_when_every_holder_is_waiting() {
         let mut board = TicketBoard::new();
-        board.hold(intent("agent-a", "edit server"));
-        board.hold(intent("agent-b", "edit server"));
+        board.hold(intent("agent-a", "fix-edit-server"));
+        board.hold(intent("agent-b", "fix-edit-server"));
 
         let cold = board.build_gate("/repo", None, BusScope::empty(), Vec::new(), false);
         let one_waiting = board.build_gate(
@@ -677,7 +727,7 @@ mod tests {
     #[test]
     fn scoped_build_gate_uses_file_overlap_and_unknown_scope_blocks() {
         let mut board = TicketBoard::new();
-        let mut docs = intent("agent-a", "edit docs");
+        let mut docs = intent("agent-a", "docs-edit-guide");
         docs.scope = BusScope::parse("docs/guide.md", "", "");
         board.hold(docs);
 
@@ -691,7 +741,7 @@ mod tests {
         assert!(unrelated.unlocked);
         assert!(unrelated.holders.is_empty());
 
-        let mut server = intent("agent-b", "edit server");
+        let mut server = intent("agent-b", "fix-edit-server");
         server.scope = BusScope::parse("src/server.py", "", "");
         board.hold(server);
         let related = board.build_gate(
@@ -704,7 +754,7 @@ mod tests {
         assert!(!related.unlocked);
         assert_eq!(related.holders, vec!["agent-b"]);
 
-        board.hold(intent("agent-c", "unknown scope"));
+        board.hold(intent("agent-c", "debug-unknown-scope"));
         let unknown = board.build_gate(
             "/repo",
             None,
@@ -718,7 +768,7 @@ mod tests {
     #[test]
     fn project_scoped_build_gate_ignores_unrelated_projects() {
         let mut board = TicketBoard::new();
-        let mut app = TicketIntent::new("/workspace/domain", "agent-a", "edit app");
+        let mut app = TicketIntent::new("/workspace/domain", "agent-a", "fix-edit-app");
         app.projects = vec!["/workspace/domain/app".to_string()];
         board.hold(app);
 
@@ -746,12 +796,12 @@ mod tests {
     #[test]
     fn new_ticket_clears_stale_build_wait_state_for_agent() {
         let mut board = TicketBoard::new();
-        board.hold(intent("agent-a", "old ticket"));
+        board.hold(intent("agent-a", "fix-old-ticket"));
         assert!(board
             .build_gate("/repo", Some("agent-a"), BusScope::empty(), Vec::new(), false)
             .unlocked);
 
-        board.hold(intent("agent-a", "new ticket"));
+        board.hold(intent("agent-a", "fix-new-ticket"));
         let gate = board.build_gate("/repo", None, BusScope::empty(), Vec::new(), false);
 
         assert!(!gate.unlocked);
@@ -762,7 +812,7 @@ mod tests {
     fn edit_gate_supports_workgroup_and_agent_modes() {
         let mut board = TicketBoard::new();
         let denied = board.edit_gate("/repo", "agent-a", EditGateMode::Workgroup);
-        board.hold(intent("agent-b", "editing"));
+        board.hold(intent("agent-b", "fix-editing"));
         let workgroup_allowed = board.edit_gate("/repo", "agent-a", EditGateMode::Workgroup);
         let agent_denied = board.edit_gate("/repo", "agent-a", EditGateMode::Agent);
         let agent_allowed = board.edit_gate("/repo", "agent-b", EditGateMode::Agent);

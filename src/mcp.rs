@@ -97,7 +97,7 @@ fn initialize_result(request: &Map<String, Value>) -> Value {
             "name": "hsp",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Rust HSP broker/workgroup tools. Ticket titles must be lowercase hyphen-separated slugs prefixed with fix, feat, docs, refactor, test, chore, perf, build, ci, style, revert, review, debug, ops, or release, for example feat-ticket-title. LSP tools are still routed by the Python reference until the Rust runtime wave lands.",
+        "instructions": "Rust HSP broker/workgroup tools. Ticket titles must be lowercase hyphen-separated slugs prefixed with fix, feat, docs, refactor, test, chore, perf, build, ci, style, revert, review, debug, ops, or release, for example feat-ticket-title. LSP tools route through the Rust broker and hsp-lsp runtime.",
     })
 }
 

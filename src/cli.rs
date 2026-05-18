@@ -28,6 +28,7 @@ pub fn run() -> CliResult {
         "hook" => hook_command(&args[1..]),
         "log" => log_command(&args[1..]),
         "mcp" => crate::mcp::run(),
+        "redirect-hook" => redirect_hook_command(),
         "run" => run_command(&args[1..]),
         "wrap" => wrap_command(&args[1..]),
         "cargo" | "spaceship" => wrapped_alias_command(command, &args[1..]),
@@ -52,6 +53,20 @@ pub fn run() -> CliResult {
             Ok(())
         }
     }
+}
+
+fn redirect_hook_command() -> CliResult {
+    let mut payload = String::new();
+    let _ = std::io::stdin().read_to_string(&mut payload);
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "The built-in LSP tool is disabled in favor of the hsp MCP tools (lsp_grep, lsp_symbols_at, lsp_symbol, lsp_refs, lsp_outline, lsp_calls, lsp_types, lsp_session, lsp_rename, lsp_move, lsp_fix, lsp_confirm). They accept symbol names directly, batch with commas, and route through the configured LSP chain. Reconstruct your call using the appropriate lsp_* MCP tool."
+        }
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
 }
 
 fn log_command(args: &[OsString]) -> CliResult {
@@ -1672,6 +1687,7 @@ fn print_help() {
     println!("  hsp workgroup [path]");
     println!("  hsp broker");
     println!("  hsp mcp");
+    println!("  hsp redirect-hook");
     println!("  hsp socket");
     println!("  hsp ping|status|shutdown");
     println!("  hsp hook stdin <kind> [options]");

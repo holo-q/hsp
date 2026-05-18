@@ -1,0 +1,62 @@
+{
+  "name": "hsp",
+  "version": "0.16.0",
+  "description": "Harness Server Protocol: Rust workgroup and LSP broker for agents",
+  "author": {
+    "name": "holo-q",
+    "url": "https://github.com/holo-q"
+  },
+  "homepage": "https://github.com/holo-q/hsp",
+  "repository": "https://github.com/holo-q/hsp",
+  "license": "MIT",
+  "keywords": ["hsp", "lsp", "language-server", "python", "csharp", "rust", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "lspServers": {
+    "ty": {
+      "command": "ty",
+      "args": ["server"],
+      "extensionToLanguage": {
+        ".py": "python",
+        ".pyi": "python"
+      }
+    },
+    "basedpyright": {
+      "command": "basedpyright-langserver",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".py": "python",
+        ".pyi": "python"
+      }
+    },
+    "csharp-ls": {
+      "command": "csharp-ls",
+      "args": [],
+      "extensionToLanguage": {
+        ".cs": "csharp"
+      }
+    },
+    "rust-analyzer": {
+      "command": "rust-analyzer",
+      "args": [],
+      "extensionToLanguage": {
+        ".rs": "rust"
+      }
+    }
+  },
+  "interface": {
+    "displayName": "HSP",
+    "shortDescription": "Rust HSP broker and workgroup tools",
+    "longDescription": "Adds HSP MCP tools for semantic navigation, workgroup tickets, shared journal context, build gates, hook telemetry, render memory, and Rust-backed LSP routing.",
+    "developerName": "holo-q",
+    "category": "Development",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/holo-q/hsp",
+    "defaultPrompt": [
+      "Use HSP to inspect this symbol.",
+      "Use HSP to open a scan-friendly work ticket.",
+      "Use HSP to check recent workgroup activity for this file."
+    ],
+    "brandColor": "#33B8A6"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hsp": {
+      "command": "hsp",
+      "args": ["mcp"],
+      "env": {
+        "HSP_ROUTER": "1"
+      }
+    }
+  }
+}
